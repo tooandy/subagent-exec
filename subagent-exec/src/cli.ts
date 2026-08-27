@@ -825,7 +825,8 @@ async function main(): Promise<void> {
       verification = await runVerification(
         cwd,
         task.verification.commands,
-        verifyTimeout
+        verifyTimeout,
+        cancellationController.signal
       );
     } catch (error) {
       verification = {

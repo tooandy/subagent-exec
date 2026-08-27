@@ -272,6 +272,7 @@ function createFailedResult(
 interface RuntimeState {
   signalReceived?: NodeJS.Signals;
   logger?: Logger;
+  cancelReject?: (error: Error) => void;
 }
 
 const runtime: RuntimeState = {};
@@ -307,6 +308,15 @@ function handleSignal(signal: NodeJS.Signals) {
 
   runtime.logger?.log("signal_received", { signal });
 
+  /*
+   * Reject the local cancellationPromise (registered by main())
+   * so the three-way race wakes up immediately. The global
+   * cancellationController is for downstream callers.
+   */
+  runtime.cancelReject?.(
+    new CancelledError(signal)
+  );
+
   abortCancellation(signal);
 }
 
@@ -317,56 +327,6 @@ function handleSignal(signal: NodeJS.Signals) {
  */
 process.on("SIGINT", () => handleSignal("SIGINT"));
 process.on("SIGTERM", () => handleSignal("SIGTERM"));
-
-/*
- * Cancel cancellation controller via sleep's AbortSignal.
- * Returns a promise that rejects when cancelled or timeout fires.
- */
-function awaitWithCancellation(
-  timeoutMs: number
-): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    /*
-     * If already aborted before we even start, fail fast.
-     */
-    if (cancellationController.signal.aborted) {
-      reject(cancellationController.signal.reason);
-      return;
-    }
-
-    /*
-     * Listen for cancellation.
-     */
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(cancellationController.signal.reason);
-    };
-
-    cancellationController.signal.addEventListener(
-      "abort",
-      onAbort,
-      { once: true }
-    );
-
-    /*
-     * Timeout timer.
-     */
-    const timer = setTimeout(() => {
-      cancellationController.signal.removeEventListener(
-        "abort",
-        onAbort
-      );
-      reject(new TimeoutError(timeoutMs));
-    }, timeoutMs);
-
-    /*
-     * Settled promise just resolves. The race will handle it.
-     * This function is used inside Promise.race() together
-     * with the settled-promise listener elsewhere.
-     */
-    resolve();
-  });
-}
 
 async function main(): Promise<void> {
   /*
@@ -502,7 +462,56 @@ async function main(): Promise<void> {
   });
 
   /*
-   * 5. Send prompt.
+   * 5. Build the three-way race promise set BEFORE sending prompt.
+   *
+   *    Per review-3: a fast Pi may emit agent_settled between
+   *    prompt RPC response and the moment we register a listener.
+   *    So we register the settled listener BEFORE awaiting prompt().
+   *
+   *    Three competitors:
+   *    - settledPromise:    resolves on agent_settled RPC event
+   *    - timeoutPromise:    rejects after timeoutMs
+   *    - cancellationPromise: rejects when SIGINT/SIGTERM fires
+   */
+  const timeoutMs = task.timeout_ms ?? DEFAULT_TIMEOUT;
+
+  let removeSettledListener: (() => void) | undefined;
+  let timeoutTimer: NodeJS.Timeout | undefined;
+
+  function cleanupRace() {
+    if (timeoutTimer) {
+      clearTimeout(timeoutTimer);
+      timeoutTimer = undefined;
+    }
+    if (removeSettledListener) {
+      removeSettledListener();
+      removeSettledListener = undefined;
+    }
+    runtime.cancelReject = undefined;
+  }
+
+  const settledPromise = new Promise<void>((resolve) => {
+    removeSettledListener = rpc.on((event) => {
+      if (event.type === "agent_settled") {
+        resolve();
+      }
+    });
+  });
+
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeoutTimer = setTimeout(() => {
+      reject(new TimeoutError(timeoutMs));
+    }, timeoutMs);
+  });
+
+  const cancellationPromise = new Promise<never>(
+    (_resolve, reject) => {
+      runtime.cancelReject = reject;
+    }
+  );
+
+  /*
+   * 6. Send prompt.
    */
   try {
     logger.log("prompt_sent");
@@ -562,34 +571,20 @@ async function main(): Promise<void> {
   }
 
   /*
-   * 6. Wait for agent_settled, timeout, or cancellation.
+   * 7. Wait for agent_settled, timeout, or cancellation.
    *
-   * Single source of truth: cancellationController.
-   * - timeout comes from setTimeout in awaitWithCancellation()
-   * - cancellation comes from signal handler aborting the controller
-   * - settled comes from RPC listener
+   *    The three promises were set up in step 5 (BEFORE prompt send)
+   *    so a fast agent_settled will not race past us.
    */
-  const timeoutMs = task.timeout_ms ?? DEFAULT_TIMEOUT;
-
-  let removeSettledListener: (() => void) | undefined;
-
   try {
-    const settledPromise = new Promise<void>((resolve) => {
-      removeSettledListener = rpc.on((event) => {
-        if (event.type === "agent_settled") {
-          resolve();
-        }
-      });
-    });
-
-    const cancellationPromise =
-      awaitWithCancellation(timeoutMs);
-
     await Promise.race([
       settledPromise,
+      timeoutPromise,
       cancellationPromise
     ]);
   } catch (error) {
+    cleanupRace();
+
     if (error instanceof TimeoutError) {
       timeoutTriggered = true;
 
@@ -649,16 +644,12 @@ async function main(): Promise<void> {
     return;
   } finally {
     /*
-     * Bug fix #1: cancel the timeout timer explicitly
-     * via the same controller — awaitWithCancellation's
-     * internal timer was already cleared on race resolution,
-     * but aborting the controller ensures any pending
-     * listeners are released.
+     * Per review-3: explicit cleanup of all race resources.
+     * clearTimeout(timeoutTimer) removes the pending timer.
+     * removeSettledListener() unregisters the RPC listener.
+     * cancelReject = undefined releases the closure ref.
      */
-    if (!cancellationController.signal.aborted) {
-      cancellationController.abort();
-    }
-    removeSettledListener?.();
+    cleanupRace();
   }
 
   /*
@@ -759,7 +750,7 @@ async function main(): Promise<void> {
 
   if (
     !workerError &&
-    !state.finalMessage?.trim()
+    !state.assistantMessage?.trim()
   ) {
     workerError = createError(
       "protocol",

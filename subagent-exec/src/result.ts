@@ -20,7 +20,12 @@ export interface RpcState {
 
   agentEnded: boolean;
 
-  finalMessage?: string;
+  /*
+   * Final assistant message (only set from assistant role messages).
+   * Renamed from finalMessage for clarity — this field MUST only
+   * be populated from assistant messages, never from user prompt.
+   */
+  assistantMessage?: string;
 
   usage?: UsageInfo;
 
@@ -75,6 +80,26 @@ function extractText(
   return result || undefined;
 }
 
+/*
+ * Per review-3: only assistant-role messages should populate
+ * the final assistant message. User messages must never overwrite it.
+ */
+function isAssistantMessage(
+  message: unknown
+): boolean {
+  if (
+    !message ||
+    typeof message !== "object"
+  ) {
+    return false;
+  }
+
+  const role =
+    (message as Record<string, unknown>).role;
+
+  return role === "assistant";
+}
+
 export function updateRpcState(
   state: RpcState,
   event: RpcEvent
@@ -87,15 +112,23 @@ export function updateRpcState(
     case "agent_end":
       state.agentEnded = true;
 
+      /*
+       * agent_end may include messages array.
+       * Only update from assistant messages.
+       */
       if (Array.isArray(event.messages)) {
         for (
           const message of event.messages
         ) {
+          if (!isAssistantMessage(message)) {
+            continue;
+          }
+
           const text =
             extractText(message);
 
           if (text) {
-            state.finalMessage = text;
+            state.assistantMessage = text;
           }
         }
       }
@@ -107,28 +140,41 @@ export function updateRpcState(
       break;
 
     case "message_end": {
-      const text =
-        extractText(event.message);
+      /*
+       * Only update on assistant message.
+       * Skip user message (the prompt itself).
+       */
+      if (isAssistantMessage(event.message)) {
+        const text =
+          extractText(event.message);
 
-      if (text) {
-        state.finalMessage = text;
+        if (text) {
+          state.assistantMessage = text;
+        }
       }
 
       break;
     }
 
     case "message_start": {
-      const text =
-        extractText(event.message);
+      if (isAssistantMessage(event.message)) {
+        const text =
+          extractText(event.message);
 
-      if (text) {
-        state.finalMessage = text;
+        if (text) {
+          state.assistantMessage = text;
+        }
       }
 
       break;
     }
 
     case "message_update": {
+      /*
+       * message_update carries assistantMessageEvent with
+       * streaming text_delta events. These are always assistant.
+       * Accumulate into assistantMessage.
+       */
       const assistantEvent =
         event.assistantMessageEvent;
 
@@ -143,8 +189,8 @@ export function updateRpcState(
           e.type === "text_delta" &&
           typeof e.delta === "string"
         ) {
-          state.finalMessage =
-            (state.finalMessage ?? "") +
+          state.assistantMessage =
+            (state.assistantMessage ?? "") +
             e.delta;
         }
       }
@@ -194,12 +240,12 @@ export function buildResult(
 
     result: {
       summary:
-        state.finalMessage
-          ? state.finalMessage.slice(0, 4000)
+        state.assistantMessage
+          ? state.assistantMessage.slice(0, 4000)
           : undefined,
 
       final_message:
-        state.finalMessage,
+        state.assistantMessage,
 
       changed_files:
         scope.changed_files

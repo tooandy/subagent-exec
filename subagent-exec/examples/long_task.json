@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.0",
+
+  "task_id": "INVESTIGATE-001",
+
+  "objective": "深度调研代码并产出报告",
+
+  "prompt": "请深度分析当前目录所有 .ts 源文件。对每个文件：1) 读完整内容；2) 列出主要导出符号；3) 描述其依赖关系；4) 指出潜在 bug 或性能问题；5) 给出改进建议。最后输出汇总报告（至少 3000 字）。",
+
+  "cwd": ".",
+
+  "allowed_paths": [],
+
+  "constraints": [
+    "只读，不要修改任何文件"
+  ],
+
+  "acceptance_criteria": [
+    "报告覆盖所有 .ts 文件",
+    "每个文件至少 200 字分析",
+    "输出汇总报告"
+  ],
+
+  "verification": {
+    "commands": [],
+    "timeout_ms": 30000
+  },
+
+  "timeout_ms": 600000,
+
+  "metadata": {
+    "task_type": "investigation"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0",
+
+  "task_id": "REVIEW-001",
+
+  "objective": "对最新提交做代码审查",
+
+  "prompt": "请审查最近一次 git commit (git show HEAD)。对每一处变更：1) 描述变更内容；2) 评估是否解决了它声明要解决的问题；3) 指出潜在副作用或回归风险；4) 给出审查结论（接受/需修改/拒绝）。最后给出 200 字以内的总结。",
+
+  "cwd": ".",
+
+  "allowed_paths": [],
+
+  "constraints": [
+    "只读审查，不得修改任何文件",
+    "必须执行 git show HEAD 获取 diff"
+  ],
+
+  "acceptance_criteria": [
+    "覆盖每个改动文件",
+    "明确审查结论",
+    "输出总结"
+  ],
+
+  "verification": {
+    "commands": [],
+    "timeout_ms": 30000
+  },
+
+  "timeout_ms": 300000,
+
+  "metadata": {
+    "task_type": "review"
+  }
+}

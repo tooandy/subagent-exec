@@ -26,6 +26,7 @@ export type LogEventName =
   | "session_stats_parse_failed"
   | "session_stats_failed"
   | "session_stats_timeout"
+  | "child_exit_during_work"
   | "verification_start"
   | "verification_end"
   | "scope_check_start"

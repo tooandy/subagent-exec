@@ -15,8 +15,26 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "usage: delegate.sh <task.json> [--task-id ID]" >&2
+  echo "usage: delegate.sh [--task-id ID] <task.json>" >&2
   exit 64
 fi
 
-exec subagent-exec "$@"
+task_id=""
+if [[ "${1:-}" == "--task-id" ]]; then
+  if [[ $# -lt 3 ]]; then
+    echo "delegate.sh: --task-id requires ID and task.json" >&2
+    exit 64
+  fi
+  task_id=$2
+  shift 2
+fi
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: delegate.sh [--task-id ID] <task.json>" >&2
+  exit 64
+fi
+
+if [[ -n "$task_id" ]]; then
+  exec subagent-exec --task "$1" --task-id "$task_id"
+fi
+exec subagent-exec --task "$1"

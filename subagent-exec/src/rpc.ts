@@ -2,6 +2,10 @@ import {
   StringDecoder
 } from "node:string_decoder";
 
+import {
+  setTimeout as sleep
+} from "node:timers/promises";
+
 import type {
   ChildProcessWithoutNullStreams
 } from "node:child_process";
@@ -26,6 +30,8 @@ export interface RpcResponse extends RpcEvent {
 export type RpcListener =
   (event: RpcEvent) => void;
 
+const DEFAULT_RPC_DEADLINE_MS = 60_000;
+
 export class PiRpcClient {
   private readonly decoder =
     new StringDecoder("utf8");
@@ -41,6 +47,7 @@ export class PiRpcClient {
       {
         resolve: (event: RpcResponse) => void;
         reject: (error: Error) => void;
+        deadlineTimer?: ReturnType<typeof setTimeout>;
       }
     >();
 
@@ -78,6 +85,10 @@ export class PiRpcClient {
         );
 
         for (const pending of this.pending.values()) {
+          // Clear deadline timer to avoid double-reject
+          if (pending.deadlineTimer) {
+            clearTimeout(pending.deadlineTimer);
+          }
           pending.reject(error);
         }
 
@@ -167,6 +178,10 @@ export class PiRpcClient {
       if (pending) {
         this.pending.delete(event.id);
 
+        if (pending.deadlineTimer) {
+          clearTimeout(pending.deadlineTimer);
+        }
+
         pending.resolve(
           event as RpcResponse
         );
@@ -190,8 +205,16 @@ export class PiRpcClient {
     }
   }
 
-  send(
-    command: Record<string, unknown>
+  /**
+   * Send an RPC command and wait for the response with a deadline.
+   *
+   * @param command    The RPC command payload
+   * @param deadlineMs Max time to wait for a response (default 60s).
+   *                   The Pi process is expected to respond within this time.
+   */
+  async send(
+    command: Record<string, unknown>,
+    deadlineMs = DEFAULT_RPC_DEADLINE_MS
   ): Promise<RpcResponse> {
     const id =
       `subagent-exec-${++this.sequence}`;
@@ -203,50 +226,125 @@ export class PiRpcClient {
 
     return new Promise(
       (resolve, reject) => {
+        let settled = false;
+
+        // Deadline timer — ensures we never leave a pending promise.
+        const deadlineTimer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+
+          // Remove from pending map so handleLine won't double-resolve.
+          this.pending.delete(id);
+
+          reject(
+            new Error(
+              `RPC command ${command.type} timed out after ${deadlineMs}ms`
+            )
+          );
+        }, deadlineMs);
+
         this.pending.set(
           id,
           {
-            resolve,
-            reject
+            resolve: (response) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(deadlineTimer);
+              resolve(response);
+            },
+            reject: (error) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(deadlineTimer);
+              reject(error);
+            },
+            deadlineTimer
           }
         );
 
         try {
-          this.child.stdin.write(
+          const written = this.child.stdin.write(
             JSON.stringify(payload) + "\n"
           );
+          if (!written) {
+            // Buffer is full — reject immediately.
+            this.pending.delete(id);
+            clearTimeout(deadlineTimer);
+            reject(
+              new Error(
+                "stdin write buffer full; Pi process may be unresponsive"
+              )
+            );
+          }
         } catch (error) {
           this.pending.delete(id);
+          clearTimeout(deadlineTimer);
           reject(error);
         }
       }
     );
   }
 
+  /**
+   * Send prompt and wait for acceptance with a deadline.
+   * The deadline prevents hanging when Pi silently accepts without
+   * emitting a response event.
+   */
   async prompt(
-    message: string
+    message: string,
+    deadlineMs = DEFAULT_RPC_DEADLINE_MS
   ): Promise<RpcResponse> {
-    return this.send({
-      type: "prompt",
-      message
-    });
+    return this.send(
+      { type: "prompt", message },
+      deadlineMs
+    );
   }
 
-  async abort(): Promise<RpcResponse> {
-    return this.send({
-      type: "abort"
-    });
+  /**
+   * Send abort signal with a deadline.
+   * This is used during shutdown to interrupt the current Pi operation.
+   */
+  async abort(
+    deadlineMs = 10_000
+  ): Promise<RpcResponse> {
+    return this.send(
+      { type: "abort" },
+      deadlineMs
+    );
   }
 
-  async getState(): Promise<RpcResponse> {
-    return this.send({
-      type: "get_state"
-    });
+  async getState(
+    deadlineMs = DEFAULT_RPC_DEADLINE_MS
+  ): Promise<RpcResponse> {
+    return this.send(
+      { type: "get_state" },
+      deadlineMs
+    );
   }
 
-  async getSessionStats(): Promise<RpcResponse> {
-    return this.send({
-      type: "get_session_stats"
-    });
+  async getSessionStats(
+    deadlineMs = DEFAULT_RPC_DEADLINE_MS
+  ): Promise<RpcResponse> {
+    return this.send(
+      { type: "get_session_stats" },
+      deadlineMs
+    );
+  }
+
+  /**
+   * Clean up all pending requests and timers.
+   * Call this during shutdown to ensure no timers or promises are left dangling.
+   */
+  cleanup(): void {
+    for (const pending of this.pending.values()) {
+      if (pending.deadlineTimer) {
+        clearTimeout(pending.deadlineTimer);
+      }
+      pending.reject(
+        new Error("PiRpcClient.cleanup() called")
+      );
+    }
+    this.pending.clear();
+    this.listeners.clear();
   }
 }

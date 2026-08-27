@@ -82,7 +82,7 @@ Use when:
 
 The worker prompt should:
 
-- Be read-only (set `allowed_paths: []`).
+- Be read-only (set `scope: "read_only"`; `allowed_paths` does not make a task read-only).
 - Require a structured review (strengths, weaknesses, suggestions).
 
 ## Pattern 5: Test-Only Delegation
@@ -148,7 +148,7 @@ This is Codex's job. The worker is an executor.
 
 ### Skipping the review
 
-> "Worker reported completed. Done."
+> "Worker reported success. Done."
 
 Always review. Worker output is evidence, not truth.
 

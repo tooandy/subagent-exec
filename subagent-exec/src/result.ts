@@ -252,7 +252,6 @@ export function buildResult(
     },
 
     scope,
-
     verification,
 
     usage: state.usage,

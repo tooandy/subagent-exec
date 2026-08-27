@@ -18,30 +18,54 @@ The Task Contract is supplied to `subagent-exec` either as a JSON file
 | --- | --- | --- |
 | `schema_version` | string `"1.0"` | Contract version. |
 | `task_id` | string | Unique task identifier. Matches `^[A-Za-z0-9._:-]+$`, max 200 chars. |
-| `prompt` | string | Self-contained instruction sent to the worker. Must include all necessary context. |
+| `prompt` | string | Self-contained instruction sent to the worker. When `constraints` or `acceptance_criteria` are present they are appended as named sections so the worker receives them as structured data. |
 
 ### Optional fields
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `objective` | string | — | High-level intent. Not sent to worker; carried for Codex tracking. |
+| `objective` | string | — | High-level intent. **Coordinator-only**; NOT transmitted to the worker. Useful for Codex to track task purpose. |
 | `cwd` | string | process cwd | Working directory for the worker. |
-| `allowed_paths` | string[] (glob) | `[]` | Files/directories the worker is allowed to modify. Empty means scope is not checked. |
-| `constraints` | string[] | `[]` | Constraints on the implementation (e.g. "no new dependencies"). |
-| `acceptance_criteria` | string[] | `[]` | What Codex will check after the worker returns. |
+| `scope` | enum | `read_write` | `read_only` or `read_write`. In `read_only` mode any file creation, modification, or deletion fails the task regardless of `allowed_paths`. |
+| `allowed_paths` | string[] (glob) | `[]` | Files/directories the worker may modify. `read_write` + empty = scope not checked. `read_only` + any value = ANY change is a violation. |
+| `constraints` | string[] | `[]` | Implementation constraints sent to worker as a fixed `### CONSTRAINTS` section. Each entry becomes a bullet point. |
+| `acceptance_criteria` | string[] | `[]` | Acceptance criteria sent to worker as a fixed `### ACCEPTANCE CRITERIA` section. Each entry becomes a bullet point. |
 | `verification` | object | — | Commands to run after worker completes (see below). |
-| `model` | object | — | `{ provider, model }` to forward to the worker runtime. |
-| `timeout_ms` | number | 900000 | Maximum execution time in ms. Max 24h. |
+| `model` | object | — | `{ provider, model }` forwarded to worker runtime. |
+| `timeout_ms` | number | 900000 | Max execution time in ms. Max 24h (86400000). |
 | `metadata` | object | — | Free-form data passed through to the Result. |
+
+### Prompt normalization
+
+When `constraints` or `acceptance_criteria` are present, they are **not**
+concatenated into the prompt text. Instead they are appended as named
+sections:
+
+```
+<prompt>
+
+### CONSTRAINTS
+- Do not add new dependencies
+- Use TypeScript strict mode
+
+### ACCEPTANCE CRITERIA
+- PKCE flow implemented
+- Unit tests added
+```
+
+This prevents prompt injection and ensures the worker cannot accidentally
+overwrite constraints by editing the prompt.
 
 ### verification sub-object
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `commands` | string[] | Shell commands to run after the worker finishes. Fail-fast on first failure. |
+| `commands` | string[] | Shell commands to run after worker finishes. Fail-fast on first failure. |
 | `timeout_ms` | number | Per-command timeout (default 120000). |
 
-### Example
+### Examples
+
+**Standard task:**
 
 ```json
 {
@@ -50,27 +74,25 @@ The Task Contract is supplied to `subagent-exec` either as a JSON file
   "objective": "Add OAuth support",
   "prompt": "Implement OAuth 2.0 PKCE flow in src/auth/oauth.ts...",
   "cwd": "/workspace/project",
-  "allowed_paths": [
-    "src/auth/**",
-    "tests/auth/**"
-  ],
-  "constraints": [
-    "Do not add new dependencies"
-  ],
-  "acceptance_criteria": [
-    "PKCE flow implemented",
-    "Unit tests added",
-    "All existing tests pass"
-  ],
-  "verification": {
-    "commands": ["npm test"],
-    "timeout_ms": 120000
-  },
+  "allowed_paths": ["src/auth/**", "tests/auth/**"],
+  "constraints": ["Do not add new dependencies"],
+  "acceptance_criteria": ["PKCE flow implemented", "Unit tests added"],
+  "verification": { "commands": ["npm test"], "timeout_ms": 120000 },
   "timeout_ms": 900000,
-  "metadata": {
-    "parent_agent": "codex",
-    "attempt": 1
-  }
+  "metadata": { "parent_agent": "codex", "attempt": 1 }
+}
+```
+
+**Read-only review task:**
+
+```json
+{
+  "schema_version": "1.0",
+  "task_id": "REVIEW-042",
+  "objective": "Review RPC lifecycle implementation",
+  "prompt": "Review src/rpc.ts and src/cli.ts for race conditions...",
+  "cwd": "/workspace/project",
+  "scope": "read_only"
 }
 ```
 
@@ -92,7 +114,7 @@ The Task Contract is supplied to `subagent-exec` either as a JSON file
 | `result` | object | Worker output (summary, final message, changed files). |
 | `scope` | object | Workspace scope verification. |
 | `verification` | object | Verification command results. |
-| `usage` | object | Token / cost usage (may be `null` if unavailable). |
+| `usage` | object or null | Token / cost usage (may be null if unavailable). |
 | `error` | object or null | Structured error when status != success. |
 | `metadata` | object | Echoed from Task Contract. |
 
@@ -148,6 +170,7 @@ self-report.
 {
   "status": "passed",
   "allowed_paths": ["src/auth/**"],
+  "scope_mode": "read_write",
   "changed_files": ["src/auth/oauth.ts"],
   "added_files": ["src/auth/oauth.ts"],
   "modified_files": [],
@@ -156,8 +179,10 @@ self-report.
 }
 ```
 
-- `status` = `not_checked` when `allowed_paths` was empty
-- `status` = `failed` when worker modified files outside `allowed_paths`
+- `status` = `not_checked` when `allowed_paths` was empty in `read_write` mode
+- `status` = `failed` when worker modified files outside `allowed_paths` (read_write)
+  or when worker modified any file in `read_only` mode
+- `scope_mode` reflects the `scope` field from the Task Contract
 
 ### verification
 
@@ -193,15 +218,15 @@ self-report.
 }
 ```
 
-May be `null` if the worker runtime does not support session stats.
+May be null if the worker runtime does not support session stats.
 
 ### error
 
 ```json
 {
-  "category": "runtime",
-  "code": "TASK_TIMEOUT",
-  "message": "Task exceeded 900000ms",
+  "category": "quota",
+  "code": "PROVIDER_QUOTA_EXCEEDED",
+  "message": "Provider quota exceeded: ...",
   "retryable": true,
   "details": null
 }
@@ -214,33 +239,48 @@ May be `null` if the worker runtime does not support session stats.
 | `quota` | Provider rate limit / quota exceeded | yes |
 | `auth` | Missing or invalid API key | no |
 | `token` | Context window / token limit exceeded | no |
-| `runtime` | Worker crash, timeout, cancellation, scope violation, exit nonzero | varies |
+| `runtime` | Worker crash, timeout, cancellation, unexpected exit, workspace error | varies |
 | `protocol` | Invalid RPC, missing events, schema mismatch | varies |
-| `scope` | Worker modified files outside `allowed_paths` | no |
+| `scope` | Worker modified files outside `allowed_paths` (read_write) or any file (read_only) | no |
 | `verification` | Verification command failed | no |
 
 #### Common error codes
 
-| Code | Meaning |
-| --- | --- |
-| `TASK_TIMEOUT` | Worker exceeded `timeout_ms` |
-| `TASK_CANCELLED` | Worker interrupted by SIGINT/SIGTERM |
-| `PI_PROCESS_EXIT_NONZERO` | Worker exited abnormally before `agent_settled` |
-| `MODIFICATION_SCOPE_VIOLATION` | Worker changed files outside `allowed_paths` |
-| `VERIFICATION_FAILED` | One or more verification commands failed |
-| `AGENT_SETTLED_MISSING` | Worker ended without reporting completion |
-| `FINAL_MESSAGE_MISSING` | Worker produced no assistant output |
-| `PROMPT_REJECTED` | Worker runtime rejected the prompt |
-| `TASK_ID_MISMATCH` | `--task-id` CLI flag disagreed with task.json |
-| `PROVIDER_QUOTA_EXCEEDED` | Provider quota exhausted |
-| `AUTH_ERROR` | Authentication / credential failure |
-| `TOKEN_LIMIT` | Context or token limit exceeded |
+| Code | Category | Meaning |
+| --- | --- | --- |
+| `TASK_TIMEOUT` | runtime | Worker exceeded `timeout_ms` |
+| `TASK_CANCELLED` | runtime | Worker interrupted by SIGINT/SIGTERM |
+| `PI_PROCESS_EXIT_NONZERO` | runtime | Worker exited abnormally before `agent_settled` |
+| `READ_ONLY_SCOPE_VIOLATION` | scope | Worker modified files in `read_only` scope |
+| `MODIFICATION_SCOPE_VIOLATION` | scope | Worker changed files outside `allowed_paths` |
+| `VERIFICATION_FAILED` | verification | One or more verification commands failed |
+| `AGENT_SETTLED_MISSING` | protocol | Worker ended without reporting completion |
+| `FINAL_MESSAGE_MISSING` | protocol | Worker produced no assistant output (not used when auth/quota/token error is already set) |
+| `PROMPT_REJECTED` | protocol | Worker runtime rejected the prompt |
+| `TASK_ID_MISMATCH` | protocol | `--task-id` CLI flag disagreed with task.json |
+| `PROVIDER_QUOTA_EXCEEDED` | quota | Provider quota exhausted |
+| `AUTH_ERROR` | auth | Authentication / credential failure |
+| `TOKEN_LIMIT` | token | Context or token limit exceeded |
+| `WORKSPACE_ERROR` | runtime | Git repository check failed; workspace state unverifiable |
 
 ---
 
-## 3. Exit Codes
+## 3. Status Values
 
-| Code | Status |
+All four status values are mutually exclusive and exhaustive.
+
+| Status | When it occurs |
+| --- | --- |
+| `success` | No error; task completed normally |
+| `failed` | An error occurred (scope violation, verification failure, protocol error, runtime crash, etc.) |
+| `cancelled` | Task was interrupted by SIGINT or SIGTERM |
+| `timeout` | Task exceeded `timeout_ms` |
+
+---
+
+## 4. Exit Codes
+
+| Code | Meaning |
 | ---: | --- |
 | 0 | success |
 | 1 | failed |

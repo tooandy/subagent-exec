@@ -1,3 +1,8 @@
+---
+name: subagent-exec
+description: Delegate a self-contained implementation, testing, investigation, refactoring, or review task to a stateless external worker agent, then validate its structured result and workspace scope.
+---
+
 # Subagent Worker Skill
 
 ## Purpose
@@ -230,7 +235,7 @@ See `CONTRACT.md` for the exact Result Contract.
 
 Treat worker status as follows:
 
-### completed
+### success
 
 The worker claims that the task completed successfully.
 
@@ -340,7 +345,7 @@ Review the failure before retrying.
 
 A worker result is evidence, not truth.
 
-After a worker returns `completed`, Codex should verify:
+After a worker returns `success`, Codex should verify:
 
 1. Did the requested files change?
 2. Are the changes inside the allowed scope?
@@ -354,7 +359,7 @@ After a worker returns `completed`, Codex should verify:
 For important tasks, inspect the actual diff.
 
 Never mark the overall user task complete solely because the worker
-reported `completed`.
+reported `success`.
 
 ## Parallel Workers
 

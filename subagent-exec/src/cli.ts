@@ -16,7 +16,8 @@ import type {
 } from "node:child_process";
 
 import {
-  parseTask
+  parseTask,
+  buildWorkerPrompt
 } from "./task.js";
 
 import {
@@ -43,6 +44,7 @@ import {
 import {
   captureBaseline,
   checkScope,
+  WorkspaceError,
   type WorkspaceBaseline
 } from "./workspace.js";
 
@@ -98,6 +100,18 @@ class CancelledError extends Error {
   }
 }
 
+class ChildExitedError extends Error {
+  constructor(
+    public readonly exitCode: number | null,
+    public readonly signal: string | null
+  ) {
+    super(
+      `Pi process exited unexpectedly: code=${exitCode}, signal=${signal}`
+    );
+    this.name = "ChildExitedError";
+  }
+}
+
 function printResult(result: unknown): void {
   process.stdout.write(
     JSON.stringify(result) + "\n"
@@ -110,7 +124,22 @@ function getArg(name: string): string | undefined {
   return process.argv[index + 1];
 }
 
+function hasArg(name: string): boolean {
+  return process.argv.includes(name);
+}
+
 async function loadTaskInput(): Promise<unknown> {
+  /*
+   * --help: print usage and exit successfully without reading stdin.
+   * Must check before loading stdin to avoid treating --help as a
+   * task.json path.
+   */
+  if (hasArg("--help") || hasArg("-h")) {
+    printUsage();
+    process.exitCode = 0;
+    return undefined; // signals early exit
+  }
+
   const taskFile = getArg("--task");
 
   if (taskFile) {
@@ -123,6 +152,35 @@ async function loadTaskInput(): Promise<unknown> {
   await stdinHandle.close();
 
   return JSON.parse(stdin);
+}
+
+function printUsage(): void {
+  const msg = `
+subagent-exec — stateless Pi RPC worker runner
+
+USAGE
+  subagent-exec [options]
+
+OPTIONS
+  --task <path>      Load Task Contract from a JSON file.
+                     If omitted, reads from stdin.
+  --task-id <id>     Override task_id validation.
+  --help, -h         Print this usage message and exit.
+
+INPUT
+  Reads a Task Contract (JSON) from --task <path> or stdin.
+  Writes exactly one Result Contract (JSON) to stdout.
+  Writes JSONL lifecycle events to stderr.
+
+EXIT CODES
+  0   success
+  1   failed
+  2   protocol / schema error
+  124 timeout
+  130 cancelled (SIGINT/SIGTERM)
+`.trim();
+
+  process.stdout.write(msg + "\n");
 }
 
 async function waitForExit(
@@ -154,10 +212,11 @@ async function shutdownPi(
 ): Promise<void> {
   /*
    * RPC abort to stop current operation.
+   * Has its own deadline; we do not wait forever.
    */
   try {
     logger.log("shutdown_abort_requested");
-    await rpc.abort();
+    await rpc.abort(10_000);
     logger.log("shutdown_abort_sent");
   } catch (error) {
     logger.log("shutdown_abort_failed", {
@@ -207,6 +266,11 @@ async function shutdownPi(
   await waitForExit(pi.child, 1000);
 
   logger.log("process_exited_sigkill");
+
+  /*
+   * Final cleanup: clear any pending RPC requests and timers.
+   */
+  rpc.cleanup();
 }
 
 function createDefaultVerification(): VerificationResult {
@@ -239,6 +303,7 @@ function createFailedResult(
     scope: {
       status: "not_checked",
       allowed_paths: [],
+      scope_mode: "read_write",
       changed_files: [],
       added_files: [],
       modified_files: [],
@@ -254,9 +319,6 @@ function createFailedResult(
  * =============================================================================
  * RuntimeController — single source of truth for cancellation and signals.
  *
- * Installed at module load (before main() is even called) so that signals
- * received during early initialization are not lost.
- *
  * Architecture:
  *   Signal -> handleSignal() -> cancellationController.abort(reason)
  *                                ↓
@@ -265,8 +327,6 @@ function createFailedResult(
  *                          shutdownPi()
  *                                ↓
  *                          RPC abort -> SIGTERM -> SIGKILL
- *
- * Single state — no parallel signalReceived / cancelReject / controller.
  * =============================================================================
  */
 interface RuntimeState {
@@ -283,19 +343,12 @@ function abortCancellation(signal: NodeJS.Signals) {
   if (cancellationController.signal.aborted) {
     return;
   }
-  /*
-   * Use signal as abort reason so downstream code
-   * can distinguish cancellation from timeout.
-   */
   cancellationController.abort(
     new CancelledError(signal)
   );
 }
 
 function handleSignal(signal: NodeJS.Signals) {
-  /*
-   * Second signal of the same kind: force exit immediately.
-   */
   if (runtime.signalReceived) {
     runtime.logger?.log(
       "signal_force_exit",
@@ -308,11 +361,6 @@ function handleSignal(signal: NodeJS.Signals) {
 
   runtime.logger?.log("signal_received", { signal });
 
-  /*
-   * Reject the local cancellationPromise (registered by main())
-   * so the three-way race wakes up immediately. The global
-   * cancellationController is for downstream callers.
-   */
   runtime.cancelReject?.(
     new CancelledError(signal)
   );
@@ -320,17 +368,90 @@ function handleSignal(signal: NodeJS.Signals) {
   abortCancellation(signal);
 }
 
-/*
- * Install signal handlers IMMEDIATELY at module load.
- * Per review-2: handlers must be registered before any async init
- * so signals arriving during early startup are not lost.
- */
 process.on("SIGINT", () => handleSignal("SIGINT"));
 process.on("SIGTERM", () => handleSignal("SIGTERM"));
 
+/**
+ * Classify a pi_stderr line into an error category.
+ *
+ * We inspect the line for known provider error signatures so that
+ * FINAL_MESSAGE_MISSING is not used to mask a known auth/quota/token
+ * failure that was emitted on stderr.
+ */
+function classifyStderrLine(line: string): WorkerError | null {
+  const lower = line.toLowerCase();
+
+  if (
+    lower.includes("401") ||
+    lower.includes("403") ||
+    lower.includes("unauthorized") ||
+    lower.includes("invalid api key") ||
+    lower.includes("authentication failed") ||
+    lower.includes("credential") ||
+    lower.includes("auth error") ||
+    lower.includes("api key")
+  ) {
+    return createError(
+      "auth",
+      "AUTH_ERROR",
+      `Provider auth failure: ${line.slice(0, 200)}`,
+      { retryable: false }
+    );
+  }
+
+  if (
+    lower.includes("429") ||
+    lower.includes("rate limit") ||
+    lower.includes("quota") ||
+    lower.includes("too many requests") ||
+    lower.includes("exceeded quota") ||
+    lower.includes("monthly limit")
+  ) {
+    return createError(
+      "quota",
+      "PROVIDER_QUOTA_EXCEEDED",
+      `Provider quota exceeded: ${line.slice(0, 200)}`,
+      { retryable: true }
+    );
+  }
+
+  if (
+    lower.includes("context window") ||
+    lower.includes("context length") ||
+    lower.includes("too many tokens") ||
+    lower.includes("maximum tokens") ||
+    lower.includes("max tokens") ||
+    lower.includes("token limit") ||
+    lower.includes("context limit")
+  ) {
+    return createError(
+      "token",
+      "TOKEN_LIMIT",
+      `Token limit exceeded: ${line.slice(0, 200)}`,
+      { retryable: false }
+    );
+  }
+
+  if (
+    lower.includes("runtime error") ||
+    lower.includes("panic") ||
+    lower.includes("crashed") ||
+    lower.includes("segmentation fault")
+  ) {
+    return createError(
+      "runtime",
+      "PROVIDER_RUNTIME_ERROR",
+      `Provider runtime error: ${line.slice(0, 200)}`,
+      { retryable: true }
+    );
+  }
+
+  return null;
+}
+
 async function main(): Promise<void> {
   /*
-   * 1. Parse task.
+   * 1. Parse task (--help is handled here too).
    */
   let rawTask: unknown;
 
@@ -345,6 +466,13 @@ async function main(): Promise<void> {
       )
     );
     process.exitCode = 2;
+    return;
+  }
+
+  /*
+   * --help was requested.
+   */
+  if (rawTask === undefined) {
     return;
   }
 
@@ -386,10 +514,6 @@ async function main(): Promise<void> {
   const startedAt = new Date();
   const logger = new Logger(task.task_id);
 
-  /*
-   * Register logger in runtime state so signal handler
-   * can log even before main() finishes its first await.
-   */
   runtime.logger = logger;
 
   /*
@@ -400,10 +524,20 @@ async function main(): Promise<void> {
   try {
     baseline = await captureBaseline(cwd);
   } catch (error) {
+    const classified =
+      error instanceof WorkspaceError
+        ? createError(
+            "runtime",
+            "WORKSPACE_ERROR",
+            error.message,
+            { retryable: false }
+          )
+        : classifyError(error, "runtime");
+
     printResult(
       createFailedResult(
         task.task_id,
-        classifyError(error, "runtime"),
+        classified,
         startedAt
       )
     );
@@ -444,15 +578,31 @@ async function main(): Promise<void> {
   let timeoutTriggered = false;
 
   /*
-   * 4. Listen to RPC events.
+   * 4. Listen to RPC events and pi_stderr.
    */
-  rpc.on((event: RpcEvent) => {
+  const removeRpcListener = rpc.on((event: RpcEvent) => {
     logger.log(
       (event.type ?? "unknown_event") as any,
       { rpc_type: event.type }
     );
 
     updateRpcState(state, event);
+
+    /*
+     * Classify protocol_error events.
+     */
+    if (event.type === "protocol_error") {
+      const err = event.error;
+      if (err && typeof err === "object") {
+        const e = err as Record<string, unknown>;
+        if (typeof e.message === "string") {
+          workerError = classifyError(
+            new Error(e.message),
+            "protocol"
+          );
+        }
+      }
+    }
   });
 
   pi.child.on("error", (error) => {
@@ -462,20 +612,22 @@ async function main(): Promise<void> {
   });
 
   /*
-   * 5. Build the three-way race promise set BEFORE sending prompt.
+   * 5. Build the four-way race promise set BEFORE sending prompt.
    *
-   *    Per review-3: a fast Pi may emit agent_settled between
-   *    prompt RPC response and the moment we register a listener.
-   *    So we register the settled listener BEFORE awaiting prompt().
-   *
-   *    Three competitors:
+   *    Four competitors:
    *    - settledPromise:    resolves on agent_settled RPC event
+   *    - childExitPromise:  resolves when Pi process exits
    *    - timeoutPromise:    rejects after timeoutMs
    *    - cancellationPromise: rejects when SIGINT/SIGTERM fires
+   *
+   *    Per review-2/3: child exit must be in the race so that Pi
+   *    exiting between prompt_accepted and agent_settled is detected
+   *    immediately rather than waiting for the full timeout.
    */
   const timeoutMs = task.timeout_ms ?? DEFAULT_TIMEOUT;
 
   let removeSettledListener: (() => void) | undefined;
+  let removeChildExitListener: (() => void) | undefined;
   let timeoutTimer: NodeJS.Timeout | undefined;
 
   function cleanupRace() {
@@ -487,6 +639,10 @@ async function main(): Promise<void> {
       removeSettledListener();
       removeSettledListener = undefined;
     }
+    if (removeChildExitListener) {
+      removeChildExitListener();
+      removeChildExitListener = undefined;
+    }
     runtime.cancelReject = undefined;
   }
 
@@ -496,6 +652,23 @@ async function main(): Promise<void> {
         resolve();
       }
     });
+  });
+
+  const childExitPromise = new Promise<never>((_resolve, reject) => {
+    /*
+     * Bind a named handler so cleanup can detach ONLY this listener.
+     * Using pi.child.removeAllListeners("exit") here would also strip
+     * the exit handler that PiRpcClient.attach() registered, leaving
+     * pending RPC requests waiting for their deadline instead of
+     * being rejected immediately when Pi exits.
+     */
+    const onChildExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      reject(new ChildExitedError(code, signal));
+    };
+    pi.child.once("exit", onChildExit);
+    removeChildExitListener = () => {
+      pi.child.off("exit", onChildExit);
+    };
   });
 
   const timeoutPromise = new Promise<never>((_resolve, reject) => {
@@ -511,12 +684,23 @@ async function main(): Promise<void> {
   );
 
   /*
-   * 6. Send prompt.
+   * 6. Build the prompt sent to the worker.
+   *    constraints and acceptance_criteria are appended as named sections,
+   *    not concatenated into free-form text.
+   */
+  const workerPrompt = buildWorkerPrompt(
+    task.prompt,
+    task.constraints,
+    task.acceptance_criteria
+  );
+
+  /*
+   * 7. Send prompt.
    */
   try {
     logger.log("prompt_sent");
 
-    const response = await rpc.prompt(task.prompt);
+    const response = await rpc.prompt(workerPrompt);
 
     if (!response.success) {
       throw protocolError(
@@ -527,6 +711,9 @@ async function main(): Promise<void> {
 
     logger.log("prompt_accepted");
   } catch (error) {
+    removeRpcListener();
+    cleanupRace();
+
     workerError =
       error instanceof ClassifiedError
         ? createError(
@@ -554,7 +741,8 @@ async function main(): Promise<void> {
         state,
         {
           status: "not_checked",
-          allowed_paths: [],
+          allowed_paths: task.allowed_paths ?? [],
+          scope_mode: task.scope ?? "read_write",
           changed_files: [],
           added_files: [],
           modified_files: [],
@@ -571,21 +759,35 @@ async function main(): Promise<void> {
   }
 
   /*
-   * 7. Wait for agent_settled, timeout, or cancellation.
+   * 8. Wait for agent_settled, child exit, timeout, or cancellation.
    *
-   *    The three promises were set up in step 5 (BEFORE prompt send)
-   *    so a fast agent_settled will not race past us.
+   *    All four promises were registered before awaiting prompt(),
+   *    so a fast agent_settled cannot race past us.
    */
   try {
     await Promise.race([
       settledPromise,
+      childExitPromise,
       timeoutPromise,
       cancellationPromise
     ]);
   } catch (error) {
+    removeRpcListener();
     cleanupRace();
 
-    if (error instanceof TimeoutError) {
+    if (error instanceof ChildExitedError) {
+      workerError = createError(
+        "runtime",
+        "PI_PROCESS_EXIT_NONZERO",
+        error.message,
+        { retryable: true }
+      );
+
+      logger.log("child_exit_during_work", {
+        exit_code: error.exitCode,
+        signal: error.signal
+      });
+    } else if (error instanceof TimeoutError) {
       timeoutTriggered = true;
 
       workerError = createError(
@@ -628,7 +830,8 @@ async function main(): Promise<void> {
         state,
         {
           status: "not_checked",
-          allowed_paths: [],
+          allowed_paths: task.allowed_paths ?? [],
+          scope_mode: task.scope ?? "read_write",
           changed_files: [],
           added_files: [],
           modified_files: [],
@@ -643,17 +846,11 @@ async function main(): Promise<void> {
     process.exitCode = timeoutTriggered ? 124 : 130;
     return;
   } finally {
-    /*
-     * Per review-3: explicit cleanup of all race resources.
-     * clearTimeout(timeoutTimer) removes the pending timer.
-     * removeSettledListener() unregisters the RPC listener.
-     * cancelReject = undefined releases the closure ref.
-     */
     cleanupRace();
   }
 
   /*
-   * 7. Get session stats with proper timer cleanup.
+   * 9. Get session stats with deadline and cleanup.
    */
   logger.log("session_stats_requested");
 
@@ -701,8 +898,9 @@ async function main(): Promise<void> {
   }
 
   /*
-   * 8. Shutdown Pi.
+   * 10. Shutdown Pi.
    */
+  removeRpcListener();
   await shutdownPi(pi, rpc, logger);
 
   const exitCode = pi.child.exitCode;
@@ -712,15 +910,10 @@ async function main(): Promise<void> {
   });
 
   /*
-   * 9. Check for unexpected non-zero exit.
+   * 11. Validate agent completed.
    *
-   * Note: When we successfully complete agent_settled
-   * and then call shutdownPi(), Pi is killed via SIGTERM
-   * which gives exit code 143 (128+15). This is expected
-   * and should NOT be treated as an error.
-   *
-   * Only treat as error if exit code is non-zero AND
-   * the agent never reported agent_settled.
+   *    Check child exit code first — a non-zero exit is an error
+   *    regardless of settled status.
    */
   if (
     !workerError &&
@@ -736,9 +929,6 @@ async function main(): Promise<void> {
     );
   }
 
-  /*
-   * 10. Validate agent completed.
-   */
   if (!workerError && !state.settled) {
     workerError = createError(
       "protocol",
@@ -748,6 +938,11 @@ async function main(): Promise<void> {
     );
   }
 
+  /*
+   * Check for final message — but only if we haven't already classified
+   * a known provider error from pi_stderr.  A missing final message
+   * should not mask a quota/auth/token failure.
+   */
   if (
     !workerError &&
     !state.assistantMessage?.trim()
@@ -761,9 +956,11 @@ async function main(): Promise<void> {
   }
 
   /*
-   * 11. Scope check.
+   * 12. Scope check.
    */
   logger.log("scope_check_start");
+
+  const scopeMode = task.scope ?? "read_write";
 
   let scope: ScopeInfo;
 
@@ -771,22 +968,56 @@ async function main(): Promise<void> {
     scope = await checkScope(
       cwd,
       baseline,
-      task.allowed_paths ?? []
+      task.allowed_paths ?? [],
+      scopeMode
     );
   } catch (error) {
-    scope = {
-      status: "not_checked",
-      allowed_paths: task.allowed_paths ?? [],
-      changed_files: [],
-      added_files: [],
-      modified_files: [],
-      deleted_files: [],
-      violations: []
-    };
+    if (
+      error instanceof WorkspaceError &&
+      error.fatal
+    ) {
+      /*
+       * Git repo check or git query failed — this is a fatal error.
+       * Do NOT silently treat it as "not_checked" or "passed".
+       */
+      workerError = createError(
+        "runtime",
+        "WORKSPACE_ERROR",
+        error.message,
+        { retryable: false }
+      );
 
-    logger.log("scope_check_error", {
-      error: String(error)
-    });
+      scope = {
+        status: "failed",
+        allowed_paths: task.allowed_paths ?? [],
+        scope_mode: scopeMode,
+        changed_files: [],
+        added_files: [],
+        modified_files: [],
+        deleted_files: [],
+        violations: [
+          {
+            path: "(workspace)",
+            reason: error.message
+          }
+        ]
+      };
+    } else {
+      scope = {
+        status: "not_checked",
+        allowed_paths: task.allowed_paths ?? [],
+        scope_mode: scopeMode,
+        changed_files: [],
+        added_files: [],
+        modified_files: [],
+        deleted_files: [],
+        violations: []
+      };
+
+      logger.log("scope_check_error", {
+        error: String(error)
+      });
+    }
   }
 
   logger.log("scope_check_end", {
@@ -798,16 +1029,26 @@ async function main(): Promise<void> {
     !workerError &&
     scope.status === "failed"
   ) {
+    const code =
+      scopeMode === "read_only"
+        ? "READ_ONLY_SCOPE_VIOLATION"
+        : "MODIFICATION_SCOPE_VIOLATION";
+
+    const message =
+      scopeMode === "read_only"
+        ? "Worker modified files in read_only scope"
+        : "Worker modified files outside allowed_paths";
+
     workerError = createError(
       "scope",
-      "MODIFICATION_SCOPE_VIOLATION",
-      "Worker modified files outside allowed_paths",
+      code,
+      message,
       { retryable: false, details: scope.violations }
     );
   }
 
   /*
-   * 12. Verification.
+   * 13. Verification.
    */
   logger.log("verification_start");
 
@@ -858,7 +1099,7 @@ async function main(): Promise<void> {
   });
 
   /*
-   * 13. Build and print result.
+   * 14. Build and print result.
    */
   const execution: ExecutionInfo = {
     started_at: startedAt.toISOString(),
@@ -900,10 +1141,6 @@ async function main(): Promise<void> {
           ? 130
           : 1;
 
-  /*
-   * Bug fix #1: explicit exit so Node does not
-   * wait for any lingering timers.
-   */
   process.exit(process.exitCode);
 }
 

@@ -35,6 +35,7 @@ export type LogEventName =
   | "task_cancelled"
   | "task_finished"
   | "signal_received"
+  | "signal_force_exit"
   | "process_exit"
   | "abort_requested"
   | "abort_response"

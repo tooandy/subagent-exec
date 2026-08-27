@@ -86,26 +86,28 @@ export async function checkScope(
   allowedPaths: string[]
 ): Promise<ScopeInfo> {
 
-  const [tracked, untracked, staged, modified, deleted] =
+  /*
+   * Only 4 distinct git queries needed:
+   * 1. Tracked unstaged changes
+   * 2. Staged changes
+   * 3. Untracked files (excluding ignored)
+   * 4. Deleted files
+   */
+  const [unstaged, staged, untracked, deleted] =
     await Promise.all([
       git(cwd, ["diff", "--name-only"]),
-      git(cwd, ["ls-files", "--others", "--exclude-standard"]),
       git(cwd, ["diff", "--cached", "--name-only"]),
-      git(cwd, ["diff", "--name-only"]),
+      git(cwd, ["ls-files", "--others", "--exclude-standard"]),
       git(cwd, ["diff", "--name-only", "--diff-filter=D"])
     ]);
 
   const changed = new Set<string>();
 
-  for (const line of tracked.split(/\r?\n/)) {
+  for (const line of unstaged.split(/\r?\n/)) {
     if (line.trim()) changed.add(line.trim());
   }
 
   for (const line of staged.split(/\r?\n/)) {
-    if (line.trim()) changed.add(line.trim());
-  }
-
-  for (const line of modified.split(/\r?\n/)) {
     if (line.trim()) changed.add(line.trim());
   }
 
@@ -131,25 +133,12 @@ export async function checkScope(
   const deletedFiles: string[] = [];
 
   for (const path of workerChanged) {
-    if (
-      baseline.dirtyPaths.has(path) === false &&
-      !baseline.dirtyPaths.has(path.replace(/\0.+$/, ""))
-    ) {
-      const isNew =
-        untracked.includes(path);
-      const isDeleted =
-        deleted.includes(path);
+    const isNew = untracked.includes(path);
+    const isDeleted = deleted.includes(path);
 
-      if (isNew && !isDeleted) {
-        added.push(path);
-      } else if (isDeleted) {
-        deletedFiles.push(path);
-      } else {
-        modifiedFiles.push(path);
-      }
-    } else if (
-      deleted.includes(path)
-    ) {
+    if (isNew && !isDeleted) {
+      added.push(path);
+    } else if (isDeleted) {
       deletedFiles.push(path);
     } else {
       modifiedFiles.push(path);

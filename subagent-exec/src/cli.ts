@@ -1,5 +1,6 @@
 import {
-  readFile
+  readFile,
+  open
 } from "node:fs/promises";
 
 import {
@@ -9,10 +10,6 @@ import {
 import {
   setTimeout as sleep
 } from "node:timers/promises";
-
-import {
-  open
-} from "node:fs/promises";
 
 import type {
   ChildProcessWithoutNullStreams
@@ -82,6 +79,25 @@ const DEFAULT_VERIFY_TIMEOUT =
 const SHUTDOWN_GRACE_MS = 3000;
 
 const SIGTERM_GRACE_MS = 2000;
+
+const STATS_TIMEOUT_MS = 5000;
+
+/*
+ * Custom error types for distinguishing timeout vs cancellation.
+ */
+class TimeoutError extends Error {
+  constructor(public readonly timeoutMs: number) {
+    super("TIMEOUT");
+    this.name = "TimeoutError";
+  }
+}
+
+class CancelledError extends Error {
+  constructor(public readonly signal: NodeJS.Signals) {
+    super(`CANCELLED:${signal}`);
+    this.name = "CancelledError";
+  }
+}
 
 function printResult(result: unknown): void {
   process.stdout.write(
@@ -363,11 +379,38 @@ async function main(): Promise<void> {
   });
 
   /*
-   * 5. Handle signals.
+   * 5. Setup cancellation and timeout controllers.
+   *
+   * BUG FIX #2 (P0): SIGINT/SIGTERM must immediately
+   * abort the wait, not just record the signal.
    */
+  const cancellationController = new AbortController();
+  const timeoutController = new AbortController();
+
+  let cancelReject: ((error: Error) => void) | undefined;
+
   const handleSignal = (signal: NodeJS.Signals) => {
+    if (signalReceived) {
+      /*
+       * Second signal: force exit.
+       */
+      logger.log("signal_force_exit", { signal });
+      process.exit(130);
+    }
+
     signalReceived = signal;
+
     logger.log("signal_received", { signal });
+
+    /*
+     * Immediately reject the cancellation promise
+     * to interrupt the wait.
+     */
+    cancelReject?.(
+      new CancelledError(signal)
+    );
+
+    cancellationController.abort();
   };
 
   process.on("SIGINT", () => handleSignal("SIGINT"));
@@ -434,33 +477,57 @@ async function main(): Promise<void> {
   }
 
   /*
-   * 7. Wait for agent_settled or timeout.
+   * 7. Wait for agent_settled, timeout, or cancellation.
+   *
+   * BUG FIX #1 (P0): Use AbortController so that:
+   *   - timeout timer is cleared once promise settles
+   *   - listeners are properly cleaned up
+   *
+   * BUG FIX #2 (P0): signal handler calls cancelReject()
+   *   so cancellation immediately interrupts the wait.
+   *
+   * BUG FIX #4 (P1): Listener is explicitly removed in finally.
    */
   const timeoutMs = task.timeout_ms ?? DEFAULT_TIMEOUT;
 
+  let removeSettledListener: (() => void) | undefined;
+
   try {
     const settledPromise = new Promise<void>((resolve) => {
-      const check = rpc.on((event) => {
+      removeSettledListener = rpc.on((event) => {
         if (event.type === "agent_settled") {
-          check();
           resolve();
         }
       });
     });
 
-    const timeoutPromise = sleep(timeoutMs).then(
-      () => {
-        throw new Error("TIMEOUT");
+    const timeoutPromise = sleep(
+      timeoutMs,
+      undefined,
+      { signal: timeoutController.signal }
+    ).then(() => {
+      throw new TimeoutError(timeoutMs);
+    });
+
+    const cancellationPromise = new Promise<never>(
+      (_, reject) => {
+        cancelReject = reject;
       }
     );
 
-    await Promise.race([settledPromise, timeoutPromise]);
-
+    await Promise.race([
+      settledPromise,
+      timeoutPromise,
+      cancellationPromise
+    ]);
   } catch (error) {
-    if (
-      error instanceof Error &&
-      error.message === "TIMEOUT"
-    ) {
+    /*
+     * BUG FIX #1 (P0): Cancel timeout so Node can exit
+     * once other work is done.
+     */
+    timeoutController.abort();
+
+    if (error instanceof TimeoutError) {
       timeoutTriggered = true;
 
       workerError = createError(
@@ -471,6 +538,17 @@ async function main(): Promise<void> {
       );
 
       logger.log("task_timeout", { timeout_ms: timeoutMs });
+    } else if (error instanceof CancelledError) {
+      workerError = createError(
+        "runtime",
+        "TASK_CANCELLED",
+        `Task cancelled by ${error.signal}`,
+        { retryable: false }
+      );
+
+      logger.log("task_cancelled", {
+        signal: error.signal
+      });
     } else if (!workerError) {
       workerError = classifyError(error);
     }
@@ -504,66 +582,33 @@ async function main(): Promise<void> {
       )
     );
 
-    process.exitCode = timeoutTriggered ? 124 : 1;
+    process.exitCode = timeoutTriggered ? 124 : 130;
     return;
+  } finally {
+    /*
+     * BUG FIX #4 (P1): Always clean up.
+     */
+    timeoutController.abort();
+    removeSettledListener?.();
   }
 
   /*
-   * 8. Handle cancellation.
-   */
-  if (signalReceived) {
-    workerError = createError(
-      "runtime",
-      "TASK_CANCELLED",
-      `Task cancelled by ${signalReceived}`,
-      { retryable: false }
-    );
-
-    logger.log("task_cancelled", {
-      signal: signalReceived
-    });
-
-    await shutdownPi(pi, rpc, logger);
-
-    printResult(
-      buildResult(
-        task,
-        { runtime: "pi" },
-        {
-          started_at: startedAt.toISOString(),
-          finished_at: new Date().toISOString(),
-          duration_ms: Date.now() - startedAt.getTime(),
-          pid: pi.pid,
-          exit_code: pi.child.exitCode,
-          signal: signalReceived
-        },
-        state,
-        {
-          status: "not_checked",
-          allowed_paths: [],
-          changed_files: [],
-          added_files: [],
-          modified_files: [],
-          deleted_files: [],
-          violations: []
-        },
-        createDefaultVerification(),
-        workerError
-      )
-    );
-
-    process.exitCode = 130;
-    return;
-  }
-
-  /*
-   * 9. Get session stats (if available, with timeout).
+   * 8. Get session stats with proper timer cleanup.
+   *
+   * BUG FIX #3 (P1): use AbortController so timer is
+   * cancelled as soon as stats return.
    */
   logger.log("session_stats_requested");
 
+  const statsAbort = new AbortController();
+
   try {
     const statsPromise = rpc.getSessionStats();
-    const timeoutPromise = sleep(5000).then(() => null);
+    const timeoutPromise = sleep(
+      STATS_TIMEOUT_MS,
+      undefined,
+      { signal: statsAbort.signal }
+    ).then(() => null);
 
     const statsResponse =
       await Promise.race([
@@ -571,12 +616,14 @@ async function main(): Promise<void> {
         timeoutPromise
       ]);
 
+    /*
+     * Cancel whichever promise didn't win.
+     */
+    statsAbort.abort();
+
     if (!statsResponse) {
       logger.log("session_stats_timeout");
     } else {
-      /*
-       * Log raw response for debugging.
-       */
       logger.log("session_stats_response", {
         raw: JSON.stringify(statsResponse)
       });
@@ -593,13 +640,14 @@ async function main(): Promise<void> {
       }
     }
   } catch (error) {
+    statsAbort.abort();
     logger.log("session_stats_failed", {
       error: String(error)
     });
   }
 
   /*
-   * 10. Shutdown Pi.
+   * 9. Shutdown Pi.
    */
   await shutdownPi(pi, rpc, logger);
 
@@ -610,19 +658,32 @@ async function main(): Promise<void> {
   });
 
   /*
-   * 11. Check for unexpected non-zero exit.
+   * 10. Check for unexpected non-zero exit.
+   *
+   * Note: When we successfully complete agent_settled
+   * and then call shutdownPi(), Pi is killed via SIGTERM
+   * which gives exit code 143 (128+15). This is expected
+   * and should NOT be treated as an error.
+   *
+   * Only treat as error if exit code is non-zero AND
+   * the agent never reported agent_settled.
    */
-  if (!workerError && exitCode !== null && exitCode !== 0) {
+  if (
+    !workerError &&
+    exitCode !== null &&
+    exitCode !== 0 &&
+    !state.settled
+  ) {
     workerError = createError(
       "runtime",
       "PI_PROCESS_EXIT_NONZERO",
-      `Pi exited with code ${exitCode}`,
+      `Pi exited with code ${exitCode} before agent_settled`,
       { retryable: true }
     );
   }
 
   /*
-   * 12. Validate agent completed.
+   * 11. Validate agent completed.
    */
   if (!workerError && !state.settled) {
     workerError = createError(
@@ -646,7 +707,7 @@ async function main(): Promise<void> {
   }
 
   /*
-   * 13. Scope check.
+   * 12. Scope check.
    */
   logger.log("scope_check_start");
 
@@ -692,7 +753,7 @@ async function main(): Promise<void> {
   }
 
   /*
-   * 14. Verification.
+   * 13. Verification.
    */
   logger.log("verification_start");
 
@@ -742,7 +803,7 @@ async function main(): Promise<void> {
   });
 
   /*
-   * 15. Build and print result.
+   * 14. Build and print result.
    */
   const execution: ExecutionInfo = {
     started_at: startedAt.toISOString(),
@@ -783,6 +844,14 @@ async function main(): Promise<void> {
         : signalReceived
           ? 130
           : 1;
+
+  /*
+   * BUG FIX #1 (P0): Explicitly exit so Node does not
+   * wait for any lingering timers (defensive — the
+   * AbortController-based timer cleanup should already
+   * have removed all timers at this point).
+   */
+  process.exit(process.exitCode);
 }
 
 main().catch((error) => {
@@ -794,5 +863,5 @@ main().catch((error) => {
     )
   );
 
-  process.exitCode = 1;
+  process.exit(1);
 });

@@ -1,0 +1,32 @@
+{
+  "schema_version": "1.0",
+
+  "task_id": "TEST-001",
+
+  "objective": "检查当前项目结构并给出简短总结",
+
+  "prompt": "请检查当前项目的目录结构。不要修改任何文件。最后用简短文字总结项目主要目录以及你观察到的技术栈。",
+
+  "cwd": ".",
+
+  "allowed_paths": [],
+
+  "constraints": [],
+
+  "acceptance_criteria": [
+    "不得修改任何文件",
+    "完成项目结构检查",
+    "最后给出简短总结"
+  ],
+
+  "verification": {
+    "commands": [],
+    "timeout_ms": 30000
+  },
+
+  "timeout_ms": 300000,
+
+  "metadata": {
+    "source": "manual-test"
+  }
+}

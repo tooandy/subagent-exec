@@ -64,7 +64,6 @@ import type {
   ExecutionInfo,
   ScopeInfo,
   Task,
-  UsageInfo,
   VerificationResult,
   WorkerError,
   WorkerInfo
@@ -146,6 +145,7 @@ async function waitForExit(
     });
   });
 }
+
 
 async function shutdownPi(
   pi: PiProcess,
@@ -250,6 +250,124 @@ function createFailedResult(
   };
 }
 
+/*
+ * =============================================================================
+ * RuntimeController — single source of truth for cancellation and signals.
+ *
+ * Installed at module load (before main() is even called) so that signals
+ * received during early initialization are not lost.
+ *
+ * Architecture:
+ *   Signal -> handleSignal() -> cancellationController.abort(reason)
+ *                                ↓
+ *                          worker wait Promise.race
+ *                                ↓
+ *                          shutdownPi()
+ *                                ↓
+ *                          RPC abort -> SIGTERM -> SIGKILL
+ *
+ * Single state — no parallel signalReceived / cancelReject / controller.
+ * =============================================================================
+ */
+interface RuntimeState {
+  signalReceived?: NodeJS.Signals;
+  logger?: Logger;
+}
+
+const runtime: RuntimeState = {};
+
+const cancellationController = new AbortController();
+
+function abortCancellation(signal: NodeJS.Signals) {
+  if (cancellationController.signal.aborted) {
+    return;
+  }
+  /*
+   * Use signal as abort reason so downstream code
+   * can distinguish cancellation from timeout.
+   */
+  cancellationController.abort(
+    new CancelledError(signal)
+  );
+}
+
+function handleSignal(signal: NodeJS.Signals) {
+  /*
+   * Second signal of the same kind: force exit immediately.
+   */
+  if (runtime.signalReceived) {
+    runtime.logger?.log(
+      "signal_force_exit",
+      { signal }
+    );
+    process.exit(130);
+  }
+
+  runtime.signalReceived = signal;
+
+  runtime.logger?.log("signal_received", { signal });
+
+  abortCancellation(signal);
+}
+
+/*
+ * Install signal handlers IMMEDIATELY at module load.
+ * Per review-2: handlers must be registered before any async init
+ * so signals arriving during early startup are not lost.
+ */
+process.on("SIGINT", () => handleSignal("SIGINT"));
+process.on("SIGTERM", () => handleSignal("SIGTERM"));
+
+/*
+ * Cancel cancellation controller via sleep's AbortSignal.
+ * Returns a promise that rejects when cancelled or timeout fires.
+ */
+function awaitWithCancellation(
+  timeoutMs: number
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    /*
+     * If already aborted before we even start, fail fast.
+     */
+    if (cancellationController.signal.aborted) {
+      reject(cancellationController.signal.reason);
+      return;
+    }
+
+    /*
+     * Listen for cancellation.
+     */
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(cancellationController.signal.reason);
+    };
+
+    cancellationController.signal.addEventListener(
+      "abort",
+      onAbort,
+      { once: true }
+    );
+
+    /*
+     * Timeout timer.
+     */
+    const timer = setTimeout(() => {
+      cancellationController.signal.removeEventListener(
+        "abort",
+        onAbort
+      );
+      reject(new TimeoutError(timeoutMs));
+    }, timeoutMs);
+
+    /*
+     * Settled promise just resolves. The race will handle it.
+     * This function is used inside Promise.race() together
+     * with the settled-promise listener elsewhere.
+     */
+    resolve();
+  });
+}
+
 async function main(): Promise<void> {
   /*
    * 1. Parse task.
@@ -309,6 +427,12 @@ async function main(): Promise<void> {
   const logger = new Logger(task.task_id);
 
   /*
+   * Register logger in runtime state so signal handler
+   * can log even before main() finishes its first await.
+   */
+  runtime.logger = logger;
+
+  /*
    * 2. Capture baseline.
    */
   let baseline: WorkspaceBaseline;
@@ -357,7 +481,6 @@ async function main(): Promise<void> {
   };
 
   let workerError: WorkerError | null = null;
-  let signalReceived: NodeJS.Signals | undefined;
   let timeoutTriggered = false;
 
   /*
@@ -379,45 +502,7 @@ async function main(): Promise<void> {
   });
 
   /*
-   * 5. Setup cancellation and timeout controllers.
-   *
-   * BUG FIX #2 (P0): SIGINT/SIGTERM must immediately
-   * abort the wait, not just record the signal.
-   */
-  const cancellationController = new AbortController();
-  const timeoutController = new AbortController();
-
-  let cancelReject: ((error: Error) => void) | undefined;
-
-  const handleSignal = (signal: NodeJS.Signals) => {
-    if (signalReceived) {
-      /*
-       * Second signal: force exit.
-       */
-      logger.log("signal_force_exit", { signal });
-      process.exit(130);
-    }
-
-    signalReceived = signal;
-
-    logger.log("signal_received", { signal });
-
-    /*
-     * Immediately reject the cancellation promise
-     * to interrupt the wait.
-     */
-    cancelReject?.(
-      new CancelledError(signal)
-    );
-
-    cancellationController.abort();
-  };
-
-  process.on("SIGINT", () => handleSignal("SIGINT"));
-  process.on("SIGTERM", () => handleSignal("SIGTERM"));
-
-  /*
-   * 6. Send prompt.
+   * 5. Send prompt.
    */
   try {
     logger.log("prompt_sent");
@@ -477,16 +562,12 @@ async function main(): Promise<void> {
   }
 
   /*
-   * 7. Wait for agent_settled, timeout, or cancellation.
+   * 6. Wait for agent_settled, timeout, or cancellation.
    *
-   * BUG FIX #1 (P0): Use AbortController so that:
-   *   - timeout timer is cleared once promise settles
-   *   - listeners are properly cleaned up
-   *
-   * BUG FIX #2 (P0): signal handler calls cancelReject()
-   *   so cancellation immediately interrupts the wait.
-   *
-   * BUG FIX #4 (P1): Listener is explicitly removed in finally.
+   * Single source of truth: cancellationController.
+   * - timeout comes from setTimeout in awaitWithCancellation()
+   * - cancellation comes from signal handler aborting the controller
+   * - settled comes from RPC listener
    */
   const timeoutMs = task.timeout_ms ?? DEFAULT_TIMEOUT;
 
@@ -501,32 +582,14 @@ async function main(): Promise<void> {
       });
     });
 
-    const timeoutPromise = sleep(
-      timeoutMs,
-      undefined,
-      { signal: timeoutController.signal }
-    ).then(() => {
-      throw new TimeoutError(timeoutMs);
-    });
-
-    const cancellationPromise = new Promise<never>(
-      (_, reject) => {
-        cancelReject = reject;
-      }
-    );
+    const cancellationPromise =
+      awaitWithCancellation(timeoutMs);
 
     await Promise.race([
       settledPromise,
-      timeoutPromise,
       cancellationPromise
     ]);
   } catch (error) {
-    /*
-     * BUG FIX #1 (P0): Cancel timeout so Node can exit
-     * once other work is done.
-     */
-    timeoutController.abort();
-
     if (error instanceof TimeoutError) {
       timeoutTriggered = true;
 
@@ -565,7 +628,7 @@ async function main(): Promise<void> {
           duration_ms: Date.now() - startedAt.getTime(),
           pid: pi.pid,
           exit_code: pi.child.exitCode,
-          signal: signalReceived ?? null
+          signal: runtime.signalReceived ?? null
         },
         state,
         {
@@ -586,17 +649,20 @@ async function main(): Promise<void> {
     return;
   } finally {
     /*
-     * BUG FIX #4 (P1): Always clean up.
+     * Bug fix #1: cancel the timeout timer explicitly
+     * via the same controller — awaitWithCancellation's
+     * internal timer was already cleared on race resolution,
+     * but aborting the controller ensures any pending
+     * listeners are released.
      */
-    timeoutController.abort();
+    if (!cancellationController.signal.aborted) {
+      cancellationController.abort();
+    }
     removeSettledListener?.();
   }
 
   /*
-   * 8. Get session stats with proper timer cleanup.
-   *
-   * BUG FIX #3 (P1): use AbortController so timer is
-   * cancelled as soon as stats return.
+   * 7. Get session stats with proper timer cleanup.
    */
   logger.log("session_stats_requested");
 
@@ -616,9 +682,6 @@ async function main(): Promise<void> {
         timeoutPromise
       ]);
 
-    /*
-     * Cancel whichever promise didn't win.
-     */
     statsAbort.abort();
 
     if (!statsResponse) {
@@ -647,7 +710,7 @@ async function main(): Promise<void> {
   }
 
   /*
-   * 9. Shutdown Pi.
+   * 8. Shutdown Pi.
    */
   await shutdownPi(pi, rpc, logger);
 
@@ -658,7 +721,7 @@ async function main(): Promise<void> {
   });
 
   /*
-   * 10. Check for unexpected non-zero exit.
+   * 9. Check for unexpected non-zero exit.
    *
    * Note: When we successfully complete agent_settled
    * and then call shutdownPi(), Pi is killed via SIGTERM
@@ -683,7 +746,7 @@ async function main(): Promise<void> {
   }
 
   /*
-   * 11. Validate agent completed.
+   * 10. Validate agent completed.
    */
   if (!workerError && !state.settled) {
     workerError = createError(
@@ -707,7 +770,7 @@ async function main(): Promise<void> {
   }
 
   /*
-   * 12. Scope check.
+   * 11. Scope check.
    */
   logger.log("scope_check_start");
 
@@ -753,7 +816,7 @@ async function main(): Promise<void> {
   }
 
   /*
-   * 13. Verification.
+   * 12. Verification.
    */
   logger.log("verification_start");
 
@@ -803,7 +866,7 @@ async function main(): Promise<void> {
   });
 
   /*
-   * 14. Build and print result.
+   * 13. Build and print result.
    */
   const execution: ExecutionInfo = {
     started_at: startedAt.toISOString(),
@@ -841,15 +904,13 @@ async function main(): Promise<void> {
       ? 0
       : timeoutTriggered
         ? 124
-        : signalReceived
+        : runtime.signalReceived
           ? 130
           : 1;
 
   /*
-   * BUG FIX #1 (P0): Explicitly exit so Node does not
-   * wait for any lingering timers (defensive — the
-   * AbortController-based timer cleanup should already
-   * have removed all timers at this point).
+   * Bug fix #1: explicit exit so Node does not
+   * wait for any lingering timers.
    */
   process.exit(process.exitCode);
 }

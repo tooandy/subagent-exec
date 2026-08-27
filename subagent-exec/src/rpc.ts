@@ -243,4 +243,10 @@ export class PiRpcClient {
       type: "get_state"
     });
   }
+
+  async getSessionStats(): Promise<RpcResponse> {
+    return this.send({
+      type: "get_session_stats"
+    });
+  }
 }

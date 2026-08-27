@@ -5,8 +5,8 @@ import type {
 import type {
   ExecutionInfo,
   ScopeInfo,
-  TestInfo,
   UsageInfo,
+  VerificationResult,
   WorkerError,
   WorkerInfo,
   WorkerResult,
@@ -15,14 +15,16 @@ import type {
 
 export interface RpcState {
   settled: boolean;
+
   agentStarted: boolean;
+
   agentEnded: boolean;
 
   finalMessage?: string;
 
-  changedFiles: string[];
-
   usage?: UsageInfo;
+
+  changedFiles?: string[];
 }
 
 function extractText(
@@ -158,7 +160,7 @@ export function buildResult(
   execution: ExecutionInfo,
   state: RpcState,
   scope: ScopeInfo,
-  tests: TestInfo,
+  verification: VerificationResult,
   error: WorkerError | null
 ): WorkerResult {
   let status:
@@ -205,7 +207,9 @@ export function buildResult(
 
     scope,
 
-    tests,
+    verification,
+
+    usage: state.usage,
 
     error,
 

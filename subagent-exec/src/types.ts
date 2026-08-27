@@ -3,7 +3,9 @@ export type ErrorCategory =
   | "auth"
   | "token"
   | "runtime"
-  | "protocol";
+  | "protocol"
+  | "scope"
+  | "verification";
 
 export type TaskStatus =
   | "success"
@@ -16,41 +18,34 @@ export interface TaskModel {
   model?: string;
 }
 
+export interface VerificationConfig {
+  commands?: string[];
+  timeout_ms?: number;
+}
+
 export interface Task {
+  schema_version: "1.0";
+
   task_id: string;
 
   objective: string;
 
-  /**
-   * Actual prompt sent to Pi.
-   */
   prompt: string;
 
-  /**
-   * Working directory.
-   */
   cwd?: string;
 
-  /**
-   * Files/directories the worker is allowed to modify.
-   *
-   * Glob patterns, e.g.
-   *   src/foo/**
-   *   tests/foo/**
-   */
   allowed_paths?: string[];
 
   constraints?: string[];
 
   acceptance_criteria?: string[];
 
+  verification?: VerificationConfig;
+
   model?: TaskModel;
 
   timeout_ms?: number;
 
-  /**
-   * Additional metadata that is simply carried through.
-   */
   metadata?: Record<string, unknown>;
 }
 
@@ -62,46 +57,88 @@ export interface ExecutionInfo {
   pid?: number;
 
   exit_code?: number | null;
+
   signal?: string | null;
 }
 
 export interface WorkerInfo {
   runtime: "pi";
+
   provider?: string;
+
   model?: string;
 }
 
 export interface UsageInfo {
-  input_tokens?: number;
-  output_tokens?: number;
-  cache_read_tokens?: number;
-  cache_write_tokens?: number;
-  total_tokens?: number;
+  input_tokens: number;
+  output_tokens: number;
+
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+
+  total_tokens: number;
+
   cost?: number;
+
+  currency?: string;
 }
 
 export interface ScopeViolation {
   path: string;
+
   reason: string;
 }
 
 export interface ScopeInfo {
-  status: "passed" | "failed" | "not_checked";
+  status:
+    | "passed"
+    | "failed"
+    | "not_checked";
+
   allowed_paths: string[];
+
   changed_files: string[];
+
+  added_files: string[];
+
+  modified_files: string[];
+
+  deleted_files: string[];
+
   violations: ScopeViolation[];
 }
 
-export interface TestInfo {
-  status: "unknown" | "passed" | "failed";
+export interface VerificationResult {
+  status:
+    | "passed"
+    | "failed"
+    | "not_run";
+
   commands: string[];
+
+  results: Array<{
+    command: string;
+
+    exit_code: number | null;
+
+    duration_ms: number;
+
+    stdout?: string;
+
+    stderr?: string;
+  }>;
 }
 
 export interface WorkerError {
   category: ErrorCategory;
+
   code: string;
+
   message: string;
+
   details?: unknown;
+
+  retryable?: boolean;
 }
 
 export interface WorkerResult {
@@ -117,13 +154,15 @@ export interface WorkerResult {
 
   result: {
     summary?: string;
+
     final_message?: string;
+
     changed_files: string[];
   };
 
   scope: ScopeInfo;
 
-  tests: TestInfo;
+  verification: VerificationResult;
 
   usage?: UsageInfo;
 

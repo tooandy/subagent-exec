@@ -8,11 +8,30 @@ export class ClassifiedError extends Error {
     public readonly category: ErrorCategory,
     public readonly code: string,
     message: string,
+    public readonly retryable: boolean = false,
     public readonly details?: unknown
   ) {
     super(message);
     this.name = "ClassifiedError";
   }
+}
+
+export function createError(
+  category: ErrorCategory,
+  code: string,
+  message: string,
+  options: {
+    retryable?: boolean;
+    details?: unknown;
+  } = {}
+): WorkerError {
+  return {
+    category,
+    code,
+    message,
+    retryable: options.retryable ?? false,
+    details: options.details
+  };
 }
 
 export function classifyError(
@@ -24,6 +43,7 @@ export function classifyError(
       category: error.category,
       code: error.code,
       message: error.message,
+      retryable: error.retryable,
       details: error.details
     };
   }
@@ -43,11 +63,12 @@ export function classifyError(
     lower.includes("api key") ||
     lower.includes("credential")
   ) {
-    return {
-      category: "auth",
-      code: "AUTH_ERROR",
-      message
-    };
+    return createError(
+      "auth",
+      "AUTH_ERROR",
+      message,
+      { retryable: false }
+    );
   }
 
   if (
@@ -56,11 +77,12 @@ export function classifyError(
     lower.includes("quota") ||
     lower.includes("too many requests")
   ) {
-    return {
-      category: "quota",
-      code: "PROVIDER_QUOTA_EXCEEDED",
-      message
-    };
+    return createError(
+      "quota",
+      "PROVIDER_QUOTA_EXCEEDED",
+      message,
+      { retryable: true }
+    );
   }
 
   if (
@@ -71,18 +93,20 @@ export function classifyError(
     lower.includes("max tokens") ||
     lower.includes("token limit")
   ) {
-    return {
-      category: "token",
-      code: "TOKEN_LIMIT",
-      message
-    };
+    return createError(
+      "token",
+      "TOKEN_LIMIT",
+      message,
+      { retryable: false }
+    );
   }
 
-  return {
-    category: fallbackCategory,
-    code: "RUNTIME_ERROR",
-    message
-  };
+  return createError(
+    fallbackCategory,
+    "RUNTIME_ERROR",
+    message,
+    { retryable: false }
+  );
 }
 
 export function quotaError(
@@ -93,6 +117,7 @@ export function quotaError(
     "quota",
     "PROVIDER_QUOTA_EXCEEDED",
     message,
+    true,
     details
   );
 }
@@ -105,6 +130,7 @@ export function authError(
     "auth",
     "AUTH_ERROR",
     message,
+    false,
     details
   );
 }
@@ -117,6 +143,7 @@ export function tokenError(
     "token",
     "TOKEN_LIMIT",
     message,
+    false,
     details
   );
 }
@@ -124,12 +151,14 @@ export function tokenError(
 export function runtimeError(
   code: string,
   message: string,
-  details?: unknown
+  details?: unknown,
+  retryable = false
 ): ClassifiedError {
   return new ClassifiedError(
     "runtime",
     code,
     message,
+    retryable,
     details
   );
 }
@@ -137,12 +166,40 @@ export function runtimeError(
 export function protocolError(
   code: string,
   message: string,
-  details?: unknown
+  details?: unknown,
+  retryable = false
 ): ClassifiedError {
   return new ClassifiedError(
     "protocol",
     code,
     message,
+    retryable,
+    details
+  );
+}
+
+export function scopeError(
+  message: string,
+  details?: unknown
+): ClassifiedError {
+  return new ClassifiedError(
+    "scope",
+    "MODIFICATION_SCOPE_VIOLATION",
+    message,
+    false,
+    details
+  );
+}
+
+export function verificationError(
+  message: string,
+  details?: unknown
+): ClassifiedError {
+  return new ClassifiedError(
+    "verification",
+    "VERIFICATION_FAILED",
+    message,
+    false,
     details
   );
 }

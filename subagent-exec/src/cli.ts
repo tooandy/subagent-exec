@@ -1,6 +1,5 @@
 import {
-  readFile,
-  open
+  readFile
 } from "node:fs/promises";
 
 import {
@@ -10,6 +9,10 @@ import {
 import {
   setTimeout as sleep
 } from "node:timers/promises";
+
+import {
+  open
+} from "node:fs/promises";
 
 import type {
   ChildProcessWithoutNullStreams
@@ -24,7 +27,8 @@ import {
 } from "./logger.js";
 
 import {
-  spawnPi
+  spawnPi,
+  type PiProcess
 } from "./process.js";
 
 import {
@@ -35,14 +39,23 @@ import {
 import {
   ClassifiedError,
   classifyError,
-  protocolError,
-  runtimeError
+  createError,
+  protocolError
 } from "./errors.js";
 
 import {
   captureBaseline,
-  checkScope
+  checkScope,
+  type WorkspaceBaseline
 } from "./workspace.js";
+
+import {
+  runVerification
+} from "./verify.js";
+
+import {
+  parseUsage
+} from "./usage.js";
 
 import {
   buildResult,
@@ -52,7 +65,10 @@ import {
 
 import type {
   ExecutionInfo,
-  TestInfo,
+  ScopeInfo,
+  Task,
+  UsageInfo,
+  VerificationResult,
   WorkerError,
   WorkerInfo
 } from "./types.js";
@@ -60,51 +76,35 @@ import type {
 const DEFAULT_TIMEOUT =
   15 * 60 * 1000;
 
-const ABORT_GRACE_MS = 5000;
+const DEFAULT_VERIFY_TIMEOUT =
+  2 * 60 * 1000;
 
-const SIGTERM_GRACE_MS = 3000;
+const SHUTDOWN_GRACE_MS = 3000;
 
-function printFinalResult(
-  result: unknown
-): void {
+const SIGTERM_GRACE_MS = 2000;
+
+function printResult(result: unknown): void {
   process.stdout.write(
     JSON.stringify(result) + "\n"
   );
 }
 
-function getArg(
-  name: string
-): string | undefined {
-  const index =
-    process.argv.indexOf(name);
-
-  if (index === -1) {
-    return undefined;
-  }
-
+function getArg(name: string): string | undefined {
+  const index = process.argv.indexOf(name);
+  if (index === -1) return undefined;
   return process.argv[index + 1];
 }
 
-async function loadTask(): Promise<unknown> {
-  const taskFile =
-    getArg("--task");
+async function loadTaskInput(): Promise<unknown> {
+  const taskFile = getArg("--task");
 
   if (taskFile) {
-    const text =
-      await readFile(
-        resolve(taskFile),
-        "utf8"
-      );
-
+    const text = await readFile(resolve(taskFile), "utf8");
     return JSON.parse(text);
   }
 
-  const stdinHandle =
-    await open("/dev/stdin", "r");
-
-  const stdin =
-    await stdinHandle.readFile("utf8");
-
+  const stdinHandle = await open("/dev/stdin", "r");
+  const stdin = await stdinHandle.readFile("utf8");
   await stdinHandle.close();
 
   return JSON.parse(stdin);
@@ -113,738 +113,686 @@ async function loadTask(): Promise<unknown> {
 async function waitForExit(
   child: ChildProcessWithoutNullStreams,
   timeoutMs: number
-): Promise<{
-  code: number | null;
-  signal: NodeJS.Signals | null;
-}> {
+): Promise<boolean> {
   if (child.exitCode !== null) {
-    return {
-      code: child.exitCode,
-      signal: null
-    };
+    return true;
   }
 
-  return new Promise(
-    (resolvePromise, reject) => {
-      let timer:
-        NodeJS.Timeout | undefined;
+  return new Promise((resolvePromise) => {
+    const timer = setTimeout(
+      () => resolvePromise(false),
+      timeoutMs
+    );
 
-      const cleanup = () => {
-        if (timer) {
-          clearTimeout(timer);
-        }
-
-        child.off("exit", onExit);
-        child.off("error", onError);
-      };
-
-      const onExit = (
-        code: number | null,
-        signal: NodeJS.Signals | null
-      ) => {
-        cleanup();
-
-        resolvePromise({
-          code,
-          signal
-        });
-      };
-
-      const onError = (error: Error) => {
-        cleanup();
-        reject(error);
-      };
-
-      timer = setTimeout(
-        () => {
-          cleanup();
-
-          reject(
-            new Error(
-              "Timed out waiting for Pi process exit"
-            )
-          );
-        },
-        timeoutMs
-      );
-
-      child.once("exit", onExit);
-      child.once("error", onError);
-    }
-  );
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolvePromise(true);
+    });
+  });
 }
 
-async function gracefulAbort(
+async function shutdownPi(
+  pi: PiProcess,
   rpc: PiRpcClient,
-  child: ChildProcessWithoutNullStreams,
   logger: Logger
 ): Promise<void> {
-  logger.log("abort_requested");
-
+  /*
+   * RPC abort to stop current operation.
+   */
   try {
-    const response =
-      await rpc.abort();
-
-    logger.log(
-      "abort_response",
-      {
-        success:
-          response.success
-      }
-    );
+    logger.log("shutdown_abort_requested");
+    await rpc.abort();
+    logger.log("shutdown_abort_sent");
   } catch (error) {
-    logger.log(
-      "abort_rpc_failed",
-      {
-        error: String(error)
-      }
-    );
+    logger.log("shutdown_abort_failed", {
+      error: String(error)
+    });
   }
 
-  try {
-    await waitForExit(
-      child,
-      ABORT_GRACE_MS
-    );
+  /*
+   * Give Pi a short grace period to exit.
+   */
+  const exited = await waitForExit(
+    pi.child,
+    SHUTDOWN_GRACE_MS
+  );
 
+  if (exited) {
+    logger.log("process_exited_gracefully", {
+      exit_code: pi.child.exitCode
+    });
     return;
-  } catch {
-    logger.log("abort_grace_timeout");
   }
 
-  if (!child.killed) {
-    logger.log("sending_sigterm");
+  /*
+   * SIGTERM if still running.
+   */
+  logger.log("sending_sigterm");
+  pi.child.kill("SIGTERM");
 
-    child.kill("SIGTERM");
-  }
+  const exitedAfterTerm = await waitForExit(
+    pi.child,
+    SIGTERM_GRACE_MS
+  );
 
-  try {
-    await waitForExit(
-      child,
-      SIGTERM_GRACE_MS
-    );
-
+  if (exitedAfterTerm) {
+    logger.log("process_exited_sigterm", {
+      exit_code: pi.child.exitCode
+    });
     return;
-  } catch {
-    logger.log(
-      "sigterm_grace_timeout"
-    );
   }
 
-  if (!child.killed) {
-    logger.log("sending_sigkill");
+  /*
+   * SIGKILL if still running.
+   */
+  logger.log("sending_sigkill");
+  pi.child.kill("SIGKILL");
 
-    child.kill("SIGKILL");
-  }
+  await waitForExit(pi.child, 1000);
+
+  logger.log("process_exited_sigkill");
+}
+
+function createDefaultVerification(): VerificationResult {
+  return {
+    status: "not_run",
+    commands: [],
+    results: []
+  };
+}
+
+function createFailedResult(
+  taskId: string,
+  error: WorkerError,
+  startedAt: Date,
+  exitCode: number | null = null
+) {
+  return {
+    schema_version: "1.0",
+    task_id: taskId,
+    status: "failed",
+    worker: { runtime: "pi" },
+    execution: {
+      started_at: startedAt.toISOString(),
+      finished_at: new Date().toISOString(),
+      duration_ms:
+        Date.now() - startedAt.getTime(),
+      exit_code: exitCode
+    },
+    result: { changed_files: [] },
+    scope: {
+      status: "not_checked",
+      allowed_paths: [],
+      changed_files: [],
+      added_files: [],
+      modified_files: [],
+      deleted_files: [],
+      violations: []
+    },
+    verification: createDefaultVerification(),
+    error
+  };
 }
 
 async function main(): Promise<void> {
-  let task: ReturnType<typeof parseTask>;
+  /*
+   * 1. Parse task.
+   */
+  let rawTask: unknown;
 
   try {
-    const raw =
-      await loadTask();
-
-    task = parseTask(raw);
+    rawTask = await loadTaskInput();
   } catch (error) {
-    const result = {
-      schema_version: "1.0",
-
-      task_id: "unknown",
-
-      status: "failed",
-
-      worker: {
-        runtime: "pi"
-      },
-
-      execution: {
-        started_at:
-          new Date().toISOString(),
-
-        finished_at:
-          new Date().toISOString(),
-
-        duration_ms: 0
-      },
-
-      result: {
-        changed_files: []
-      },
-
-      scope: {
-        status: "not_checked",
-        allowed_paths: [],
-        changed_files: [],
-        violations: []
-      },
-
-      tests: {
-        status: "unknown",
-        commands: []
-      },
-
-      error: classifyError(
-        error,
-        "protocol"
+    printResult(
+      createFailedResult(
+        "unknown",
+        classifyError(error, "protocol"),
+        new Date()
       )
-    };
-
-    printFinalResult(result);
-
+    );
     process.exitCode = 2;
-
     return;
   }
 
-  const cwd =
-    resolve(
-      task.cwd ?? process.cwd()
+  const cliTaskId = getArg("--task-id");
+  let task: Task;
+
+  try {
+    task = parseTask(rawTask);
+
+    if (cliTaskId && cliTaskId !== task.task_id) {
+      printResult(
+        createFailedResult(
+          cliTaskId,
+          createError(
+            "protocol",
+            "TASK_ID_MISMATCH",
+            `Task ID mismatch: CLI "${cliTaskId}" vs task.json "${task.task_id}"`,
+            { retryable: false }
+          ),
+          new Date()
+        )
+      );
+      process.exitCode = 2;
+      return;
+    }
+  } catch (error) {
+    printResult(
+      createFailedResult(
+        "unknown",
+        classifyError(error, "protocol"),
+        new Date()
+      )
     );
+    process.exitCode = 2;
+    return;
+  }
 
-  const effectiveTask = {
-    ...task,
-    cwd
-  };
+  const cwd = resolve(task.cwd ?? process.cwd());
+  const startedAt = new Date();
+  const logger = new Logger(task.task_id);
 
-  const logger =
-    new Logger(effectiveTask);
+  /*
+   * 2. Capture baseline.
+   */
+  let baseline: WorkspaceBaseline;
 
-  const startedAt =
-    new Date();
+  try {
+    baseline = await captureBaseline(cwd);
+  } catch (error) {
+    printResult(
+      createFailedResult(
+        task.task_id,
+        classifyError(error, "runtime"),
+        startedAt
+      )
+    );
+    process.exitCode = 1;
+    return;
+  }
 
-  const baseline =
-    await captureBaseline(cwd);
+  /*
+   * 3. Spawn Pi.
+   */
+  let pi: PiProcess;
+  let rpc: PiRpcClient;
 
-  let pi:
-    | ReturnType<typeof spawnPi>
-    | undefined;
-
-  let rpc:
-    | PiRpcClient
-    | undefined;
+  try {
+    pi = spawnPi({ ...task, cwd });
+    rpc = new PiRpcClient(pi.child);
+    logger.log("process_spawned", { pid: pi.pid });
+  } catch (error) {
+    printResult(
+      createFailedResult(
+        task.task_id,
+        classifyError(error, "runtime"),
+        startedAt
+      )
+    );
+    process.exitCode = 1;
+    return;
+  }
 
   const state: RpcState = {
     settled: false,
     agentStarted: false,
     agentEnded: false,
-    changedFiles: []
+    usage: undefined
   };
 
-  let workerError:
-    | WorkerError
-    | null = null;
-
-  let signalReceived:
-    | NodeJS.Signals
-    | undefined;
-
+  let workerError: WorkerError | null = null;
+  let signalReceived: NodeJS.Signals | undefined;
   let timeoutTriggered = false;
 
-  let signalHandlerRunning = false;
-
-  try {
-    logger.log("task_started", {
-      objective: task.objective,
-      cwd,
-      timeout_ms:
-        task.timeout_ms ??
-        DEFAULT_TIMEOUT
-    });
-
-    pi = spawnPi(effectiveTask);
-
-    logger.log("process_spawned", {
-      pid: pi.pid
-    });
-
-    rpc =
-      new PiRpcClient(pi.child);
-
-    rpc.on((event: RpcEvent) => {
-      logger.log(
-        event.type ?? "unknown_event",
-        {
-          rpc_type: event.type
-        }
-      );
-
-      updateRpcState(
-        state,
-        event
-      );
-
-      if (
-        event.type ===
-        "extension_error"
-      ) {
-        logger.log(
-          "extension_error",
-          {
-            details: event
-          }
-        );
-      }
-
-      if (
-        event.type ===
-        "auto_retry_start"
-      ) {
-        logger.log(
-          "auto_retry_start"
-        );
-      }
-
-      if (
-        event.type ===
-        "compaction_start"
-      ) {
-        logger.log(
-          "compaction_start"
-        );
-      }
-    });
-
-    pi.child.on(
-      "error",
-      error => {
-        if (!workerError) {
-          workerError =
-            classifyError(
-              error
-            );
-        }
-      }
-    );
-
-    /*
-     * Forward signals into RPC abort.
-     */
-    const onSignal = (
-      signal: NodeJS.Signals
-    ) => {
-      if (signalHandlerRunning) {
-        return;
-      }
-
-      signalHandlerRunning = true;
-      signalReceived = signal;
-
-      logger.log(
-        "signal_received",
-        {
-          signal
-        }
-      );
-
-      void gracefulAbort(
-        rpc!,
-        pi!.child,
-        logger
-      ).finally(() => {
-        signalHandlerRunning = false;
-      });
-    };
-
-    process.on(
-      "SIGINT",
-      () => onSignal("SIGINT")
-    );
-
-    process.on(
-      "SIGTERM",
-      () => onSignal("SIGTERM")
-    );
-
-    const promptResponse =
-      await rpc.prompt(
-        effectiveTask.prompt
-      );
-
-    if (!promptResponse.success) {
-      throw protocolError(
-        "PROMPT_REJECTED",
-        promptResponse.error ??
-          "Pi rejected prompt"
-      );
-    }
-
+  /*
+   * 4. Listen to RPC events.
+   */
+  rpc.on((event: RpcEvent) => {
     logger.log(
-      "prompt_accepted"
+      (event.type ?? "unknown_event") as any,
+      { rpc_type: event.type }
     );
 
-    const timeoutMs =
-      task.timeout_ms ??
-      DEFAULT_TIMEOUT;
+    updateRpcState(state, event);
+  });
 
-    const timeoutPromise =
-      sleep(timeoutMs).then(
-        () => "timeout" as const
-      );
-
-    const settledPromise =
-      new Promise<"settled">(
-        resolvePromise => {
-          const unsubscribe =
-            rpc!.on(event => {
-              if (
-                event.type ===
-                "agent_settled"
-              ) {
-                unsubscribe();
-                resolvePromise(
-                  "settled"
-                );
-              }
-            });
-        }
-      );
-
-    const outcome =
-      await Promise.race([
-        timeoutPromise,
-        settledPromise
-      ]);
-
-    if (outcome === "timeout") {
-      timeoutTriggered = true;
-
-      workerError = {
-        category: "runtime",
-        code: "TASK_TIMEOUT",
-        message:
-          `Task exceeded ${timeoutMs}ms`
-      };
-
-      logger.log(
-        "task_timeout",
-        {
-          timeout_ms: timeoutMs
-        }
-      );
-
-      await gracefulAbort(
-        rpc,
-        pi.child,
-        logger
-      );
+  pi.child.on("error", (error) => {
+    if (!workerError) {
+      workerError = classifyError(error);
     }
+  });
 
-    /*
-     * If signal was received, make sure
-     * process is terminated.
-     */
-    if (signalReceived) {
-      workerError = {
-        category: "runtime",
-        code: "TASK_CANCELLED",
-        message:
-          `Task cancelled by ${signalReceived}`
-      };
-
-      await gracefulAbort(
-        rpc,
-        pi.child,
-        logger
-      );
-    }
-
-    /*
-     * Wait for process exit.
-     */
-    let exitCode:
-      number | null = null;
-
-    let exitSignal:
-      NodeJS.Signals | null = null;
-
-    if (
-      pi.child.exitCode === null
-    ) {
-      try {
-        const exit =
-          await waitForExit(
-            pi.child,
-            10_000
-          );
-
-        exitCode = exit.code;
-        exitSignal = exit.signal;
-      } catch (error) {
-        if (!workerError) {
-          workerError =
-            classifyError(error);
-        }
-      }
-    } else {
-      exitCode =
-        pi.child.exitCode;
-    }
-
-    /*
-     * If Pi exits abnormally and we don't
-     * already have a more meaningful error.
-     */
-    if (
-      !workerError &&
-      exitCode !== null &&
-      exitCode !== 0
-    ) {
-      workerError = {
-        category: "runtime",
-        code: "PI_PROCESS_EXIT_NONZERO",
-        message:
-          `Pi exited with code ${exitCode}`,
-        details: {
-          signal: exitSignal
-        }
-      };
-    }
-
-    /*
-     * agent_settled is mandatory for a normal run.
-     */
-    if (
-      !workerError &&
-      !state.settled
-    ) {
-      workerError = {
-        category: "protocol",
-        code: "AGENT_SETTLED_MISSING",
-        message:
-          "Pi process ended without agent_settled"
-      };
-    }
-
-    /*
-     * Final assistant message is mandatory.
-     */
-    if (
-      !workerError &&
-      !state.finalMessage?.trim()
-    ) {
-      workerError = {
-        category: "protocol",
-        code: "FINAL_MESSAGE_MISSING",
-        message:
-          "No final assistant message was received"
-      };
-    }
-
-    const scope =
-      await checkScope(
-        cwd,
-        baseline,
-        task.allowed_paths ?? []
-      );
-
-    state.changedFiles =
-      scope.changed_files;
-
-    if (
-      !workerError &&
-      scope.status === "failed"
-    ) {
-      workerError = {
-        category: "runtime",
-        code:
-          "MODIFICATION_SCOPE_VIOLATION",
-        message:
-          "Worker modified files outside allowed_paths",
-        details:
-          scope.violations
-      };
-    }
-
-    const finishedAt =
-      new Date();
-
-    const execution: ExecutionInfo = {
-      started_at:
-        startedAt.toISOString(),
-
-      finished_at:
-        finishedAt.toISOString(),
-
-      duration_ms:
-        finishedAt.getTime() -
-        startedAt.getTime(),
-
-      pid: pi.pid,
-
-      exit_code: exitCode,
-
-      signal: exitSignal
-    };
-
-    const worker: WorkerInfo = {
-      runtime: "pi",
-      provider:
-        task.model?.provider,
-      model:
-        task.model?.model
-    };
-
-    const tests: TestInfo = {
-      status: "unknown",
-      commands: []
-    };
-
-    const result =
-      buildResult(
-        task,
-        worker,
-        execution,
-        state,
-        scope,
-        tests,
-        workerError
-      );
-
-    /*
-     * Strict final output.
-     */
-    printFinalResult(result);
-
-    process.exitCode =
-      result.status === "success"
-        ? 0
-        : timeoutTriggered
-          ? 124
-          : signalReceived
-            ? 130
-            : 1;
-  } catch (error) {
-    const finishedAt =
-      new Date();
-
-    const classified =
-      error instanceof ClassifiedError
-        ? {
-            category: error.category,
-            code: error.code,
-            message: error.message,
-            details: error.details
-          }
-        : classifyError(error);
-
-    const scope =
-      await checkScope(
-        cwd,
-        baseline,
-        task.allowed_paths ?? []
-      ).catch(() => ({
-        status: "not_checked" as const,
-        allowed_paths:
-          task.allowed_paths ?? [],
-        changed_files: [],
-        violations: []
-      }));
-
-    const execution: ExecutionInfo = {
-      started_at:
-        finishedAt.toISOString(),
-
-      finished_at:
-        finishedAt.toISOString(),
-
-      duration_ms:
-        finishedAt.getTime() -
-        startedAt.getTime(),
-
-      pid: pi?.pid,
-
-      exit_code:
-        pi?.child.exitCode ?? null,
-
-      signal: null
-    };
-
-    const result =
-      buildResult(
-        task,
-
-        {
-          runtime: "pi",
-          provider:
-            task.model?.provider,
-          model:
-            task.model?.model
-        },
-
-        execution,
-
-        state,
-
-        scope,
-
-        {
-          status: "unknown",
-          commands: []
-        },
-
-        classified
-      );
-
-    printFinalResult(result);
-
-    process.exitCode = 1;
-
-    if (pi?.child) {
-      await gracefulAbort(
-        rpc!,
-        pi.child,
-        logger
-      ).catch(() => {});
-    }
-  }
-}
-
-main().catch(error => {
-  const result = {
-    schema_version: "1.0",
-
-    task_id: "unknown",
-
-    status: "failed",
-
-    worker: {
-      runtime: "pi"
-    },
-
-    execution: {
-      started_at:
-        new Date().toISOString(),
-
-      finished_at:
-        new Date().toISOString(),
-
-      duration_ms: 0
-    },
-
-    result: {
-      changed_files: []
-    },
-
-    scope: {
-      status: "not_checked",
-      allowed_paths: [],
-      changed_files: [],
-      violations: []
-    },
-
-    tests: {
-      status: "unknown",
-      commands: []
-    },
-
-    error: classifyError(
-      error,
-      "runtime"
-    )
+  /*
+   * 5. Handle signals.
+   */
+  const handleSignal = (signal: NodeJS.Signals) => {
+    signalReceived = signal;
+    logger.log("signal_received", { signal });
   };
 
-  printFinalResult(result);
+  process.on("SIGINT", () => handleSignal("SIGINT"));
+  process.on("SIGTERM", () => handleSignal("SIGTERM"));
+
+  /*
+   * 6. Send prompt.
+   */
+  try {
+    logger.log("prompt_sent");
+
+    const response = await rpc.prompt(task.prompt);
+
+    if (!response.success) {
+      throw protocolError(
+        "PROMPT_REJECTED",
+        response.error ?? "Pi rejected prompt"
+      );
+    }
+
+    logger.log("prompt_accepted");
+  } catch (error) {
+    workerError =
+      error instanceof ClassifiedError
+        ? createError(
+            error.category,
+            error.code,
+            error.message,
+            { retryable: error.retryable }
+          )
+        : classifyError(error);
+
+    await shutdownPi(pi, rpc, logger);
+
+    printResult(
+      buildResult(
+        task,
+        { runtime: "pi" },
+        {
+          started_at: startedAt.toISOString(),
+          finished_at: new Date().toISOString(),
+          duration_ms: Date.now() - startedAt.getTime(),
+          pid: pi.pid,
+          exit_code: pi.child.exitCode,
+          signal: null
+        },
+        state,
+        {
+          status: "not_checked",
+          allowed_paths: [],
+          changed_files: [],
+          added_files: [],
+          modified_files: [],
+          deleted_files: [],
+          violations: []
+        },
+        createDefaultVerification(),
+        workerError
+      )
+    );
+
+    process.exitCode = 1;
+    return;
+  }
+
+  /*
+   * 7. Wait for agent_settled or timeout.
+   */
+  const timeoutMs = task.timeout_ms ?? DEFAULT_TIMEOUT;
+
+  try {
+    const settledPromise = new Promise<void>((resolve) => {
+      const check = rpc.on((event) => {
+        if (event.type === "agent_settled") {
+          check();
+          resolve();
+        }
+      });
+    });
+
+    const timeoutPromise = sleep(timeoutMs).then(
+      () => {
+        throw new Error("TIMEOUT");
+      }
+    );
+
+    await Promise.race([settledPromise, timeoutPromise]);
+
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message === "TIMEOUT"
+    ) {
+      timeoutTriggered = true;
+
+      workerError = createError(
+        "runtime",
+        "TASK_TIMEOUT",
+        `Task exceeded ${timeoutMs}ms`,
+        { retryable: true }
+      );
+
+      logger.log("task_timeout", { timeout_ms: timeoutMs });
+    } else if (!workerError) {
+      workerError = classifyError(error);
+    }
+
+    await shutdownPi(pi, rpc, logger);
+
+    printResult(
+      buildResult(
+        task,
+        { runtime: "pi" },
+        {
+          started_at: startedAt.toISOString(),
+          finished_at: new Date().toISOString(),
+          duration_ms: Date.now() - startedAt.getTime(),
+          pid: pi.pid,
+          exit_code: pi.child.exitCode,
+          signal: signalReceived ?? null
+        },
+        state,
+        {
+          status: "not_checked",
+          allowed_paths: [],
+          changed_files: [],
+          added_files: [],
+          modified_files: [],
+          deleted_files: [],
+          violations: []
+        },
+        createDefaultVerification(),
+        workerError
+      )
+    );
+
+    process.exitCode = timeoutTriggered ? 124 : 1;
+    return;
+  }
+
+  /*
+   * 8. Handle cancellation.
+   */
+  if (signalReceived) {
+    workerError = createError(
+      "runtime",
+      "TASK_CANCELLED",
+      `Task cancelled by ${signalReceived}`,
+      { retryable: false }
+    );
+
+    logger.log("task_cancelled", {
+      signal: signalReceived
+    });
+
+    await shutdownPi(pi, rpc, logger);
+
+    printResult(
+      buildResult(
+        task,
+        { runtime: "pi" },
+        {
+          started_at: startedAt.toISOString(),
+          finished_at: new Date().toISOString(),
+          duration_ms: Date.now() - startedAt.getTime(),
+          pid: pi.pid,
+          exit_code: pi.child.exitCode,
+          signal: signalReceived
+        },
+        state,
+        {
+          status: "not_checked",
+          allowed_paths: [],
+          changed_files: [],
+          added_files: [],
+          modified_files: [],
+          deleted_files: [],
+          violations: []
+        },
+        createDefaultVerification(),
+        workerError
+      )
+    );
+
+    process.exitCode = 130;
+    return;
+  }
+
+  /*
+   * 9. Get session stats (if available, with timeout).
+   */
+  logger.log("session_stats_requested");
+
+  try {
+    const statsPromise = rpc.getSessionStats();
+    const timeoutPromise = sleep(5000).then(() => null);
+
+    const statsResponse =
+      await Promise.race([
+        statsPromise,
+        timeoutPromise
+      ]);
+
+    if (!statsResponse) {
+      logger.log("session_stats_timeout");
+    } else {
+      /*
+       * Log raw response for debugging.
+       */
+      logger.log("session_stats_response", {
+        raw: JSON.stringify(statsResponse)
+      });
+
+      const usage = parseUsage(statsResponse);
+
+      if (usage) {
+        state.usage = usage;
+        logger.log("session_stats_received", { usage });
+      } else {
+        logger.log("session_stats_parse_failed", {
+          raw: JSON.stringify(statsResponse)
+        });
+      }
+    }
+  } catch (error) {
+    logger.log("session_stats_failed", {
+      error: String(error)
+    });
+  }
+
+  /*
+   * 10. Shutdown Pi.
+   */
+  await shutdownPi(pi, rpc, logger);
+
+  const exitCode = pi.child.exitCode;
+
+  logger.log("process_exit", {
+    exit_code: exitCode
+  });
+
+  /*
+   * 11. Check for unexpected non-zero exit.
+   */
+  if (!workerError && exitCode !== null && exitCode !== 0) {
+    workerError = createError(
+      "runtime",
+      "PI_PROCESS_EXIT_NONZERO",
+      `Pi exited with code ${exitCode}`,
+      { retryable: true }
+    );
+  }
+
+  /*
+   * 12. Validate agent completed.
+   */
+  if (!workerError && !state.settled) {
+    workerError = createError(
+      "protocol",
+      "AGENT_SETTLED_MISSING",
+      "Pi process ended without agent_settled",
+      { retryable: true }
+    );
+  }
+
+  if (
+    !workerError &&
+    !state.finalMessage?.trim()
+  ) {
+    workerError = createError(
+      "protocol",
+      "FINAL_MESSAGE_MISSING",
+      "No final assistant message was received",
+      { retryable: true }
+    );
+  }
+
+  /*
+   * 13. Scope check.
+   */
+  logger.log("scope_check_start");
+
+  let scope: ScopeInfo;
+
+  try {
+    scope = await checkScope(
+      cwd,
+      baseline,
+      task.allowed_paths ?? []
+    );
+  } catch (error) {
+    scope = {
+      status: "not_checked",
+      allowed_paths: task.allowed_paths ?? [],
+      changed_files: [],
+      added_files: [],
+      modified_files: [],
+      deleted_files: [],
+      violations: []
+    };
+
+    logger.log("scope_check_error", {
+      error: String(error)
+    });
+  }
+
+  logger.log("scope_check_end", {
+    status: scope.status,
+    changed_files: scope.changed_files
+  });
+
+  if (
+    !workerError &&
+    scope.status === "failed"
+  ) {
+    workerError = createError(
+      "scope",
+      "MODIFICATION_SCOPE_VIOLATION",
+      "Worker modified files outside allowed_paths",
+      { retryable: false, details: scope.violations }
+    );
+  }
+
+  /*
+   * 14. Verification.
+   */
+  logger.log("verification_start");
+
+  let verification = createDefaultVerification();
+
+  if (
+    !workerError &&
+    task.verification?.commands?.length
+  ) {
+    const verifyTimeout =
+      task.verification.timeout_ms ??
+      DEFAULT_VERIFY_TIMEOUT;
+
+    try {
+      verification = await runVerification(
+        cwd,
+        task.verification.commands,
+        verifyTimeout
+      );
+    } catch (error) {
+      verification = {
+        status: "failed",
+        commands: task.verification.commands,
+        results: [
+          {
+            command: task.verification.commands[0],
+            exit_code: null,
+            duration_ms: 0,
+            stderr: String(error)
+          }
+        ]
+      };
+    }
+
+    if (verification.status === "failed") {
+      workerError = createError(
+        "verification",
+        "VERIFICATION_FAILED",
+        "Verification commands failed",
+        { retryable: false, details: verification.results }
+      );
+    }
+  }
+
+  logger.log("verification_end", {
+    status: verification.status
+  });
+
+  /*
+   * 15. Build and print result.
+   */
+  const execution: ExecutionInfo = {
+    started_at: startedAt.toISOString(),
+    finished_at: new Date().toISOString(),
+    duration_ms: Date.now() - startedAt.getTime(),
+    pid: pi.pid,
+    exit_code: exitCode,
+    signal: null
+  };
+
+  const worker: WorkerInfo = {
+    runtime: "pi",
+    provider: task.model?.provider,
+    model: task.model?.model
+  };
+
+  const result = buildResult(
+    task,
+    worker,
+    execution,
+    state,
+    scope,
+    verification,
+    workerError
+  );
+
+  printResult(result);
+
+  logger.log("task_finished", {
+    status: result.status
+  });
+
+  process.exitCode =
+    result.status === "success"
+      ? 0
+      : timeoutTriggered
+        ? 124
+        : signalReceived
+          ? 130
+          : 1;
+}
+
+main().catch((error) => {
+  printResult(
+    createFailedResult(
+      "unknown",
+      classifyError(error, "runtime"),
+      new Date()
+    )
+  );
 
   process.exitCode = 1;
 });

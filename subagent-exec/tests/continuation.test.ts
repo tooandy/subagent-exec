@@ -350,6 +350,11 @@ describe("continuation CLI integration", () => {
       assert.equal(parsed.continuation.allow_continuation, false);
       assert.equal(parsed.continuation.state, "coordinator_required");
       assert.equal(parsed.continuation.failure_class, "runtime:SESSION_PERSISTENCE_FAILED");
+      const outcome = JSON.parse(await readFile(join(blockedPath, "outcomes", "PERSIST-FAIL.json"), "utf8"));
+      assert.equal(outcome.attempts, 1);
+      assert.equal(outcome.total_worker_tokens, 0);
+      assert.equal(outcome.terminal_failure_reason, "SESSION_PERSISTENCE_FAILED");
+      assert.equal(outcome.delegation_outcome, "amplified");
     } finally { await f.cleanup(); }
   });
 
@@ -564,6 +569,7 @@ describe("continuation CLI integration", () => {
       const command = `node -e "const fs=require('fs'); if(fs.existsSync('${marker}')) process.exit(0); fs.writeFileSync('${marker}','1'); process.exit(1)"`;
       const evidence = `\`\`\`subagent-evidence\n${JSON.stringify({ criteria: [{ criterion: "passes", status: "passed", evidence: [{ type: "command", reference: command }] }] })}\n\`\`\``;
       const task = { schema_version: "1.0", task_id: "CANDIDATE-REPAIR", prompt: "plan", cwd: f.dir,
+        task_class: "small_feature",
         scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["passes"], verification: { commands: [command] },
         iteration: { max_iterations: 3 }, execution_policy: { mode: "checkpoint", risk: "medium", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" } };
       await runCli(f.dir, f.env, [], JSON.stringify(task));
@@ -573,6 +579,11 @@ describe("continuation CLI integration", () => {
       assert.equal(repaired.status, "success");
       assert.equal(repaired.candidate.status, "ready");
       assert.equal(await readFile(join(f.dir, "tracked.txt"), "utf8"), "base");
+      const outcome = JSON.parse(await readFile(join(f.dir, ".subagent-exec", "outcomes", "CANDIDATE-REPAIR.json"), "utf8"));
+      assert.equal(outcome.task_class, "small_feature");
+      assert.equal(outcome.attempts, 3);
+      assert.equal(outcome.total_worker_tokens, 6);
+      assert.equal(outcome.total_worker_cost, 0.03);
     } finally { await f.cleanup(); }
   });
 
@@ -653,6 +664,9 @@ describe("continuation CLI integration", () => {
         execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
       }))).stdout);
       assert.equal(result.candidate.status, "discarded");
+      const outcome = JSON.parse(await readFile(join(f.dir, ".subagent-exec", "outcomes", "DISCARD.json"), "utf8"));
+      assert.equal(outcome.delegation_outcome, "amplified");
+      assert.equal(outcome.terminal_failure_reason, "MODIFICATION_SCOPE_VIOLATION");
       await assert.rejects(() => readFile(join(f.dir, "outside.txt"), "utf8"));
     } finally { await f.cleanup(); }
   });
@@ -668,7 +682,10 @@ describe("continuation CLI integration", () => {
         execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
       }));
       const rejected = await runCli(f.dir, f.env, ["--reject-candidate", "REJECT-CANDIDATE"]);
-      assert.equal(JSON.parse(rejected.stdout).status, "rejected");
+      const rejectedResult = JSON.parse(rejected.stdout);
+      assert.equal(rejectedResult.status, "rejected", rejected.stdout);
+      assert.equal(rejectedResult.outcome.coordinator_decision, "rejected");
+      assert.equal(rejectedResult.outcome.delegation_outcome, "amplified");
       assert.equal(await readFile(join(f.dir, "tracked.txt"), "utf8"), "base");
     } finally { await f.cleanup(); }
   });
@@ -791,6 +808,101 @@ describe("continuation CLI integration", () => {
       assert.equal(await readFile(join(f.dir, "tracked.txt"), "utf8"), "user edit\n");
       const traversal = await runCli(f.dir, f.env, ["--accept-candidate", "../escape"]);
       assert.equal(JSON.parse(traversal.stdout).error.code, "CANDIDATE_APPLY_FAILED");
+      const rejectTraversal = await runCli(f.dir, f.env, ["--reject-candidate", "../escape"]);
+      assert.equal(JSON.parse(rejectTraversal.stdout).error.code, "CANDIDATE_REJECT_FAILED");
+      await assert.rejects(() => readFile(join(f.dir, ".subagent-exec", "escape.json"), "utf8"));
     } finally { await f.cleanup(); }
+  });
+
+  test("records cost, coordinator decision, elapsed time, and later rework outcome", async () => {
+    const f = await fixture();
+    try {
+      const evidence = `\`\`\`subagent-evidence\n${JSON.stringify({ criteria: [{ criterion: "measured", status: "passed", evidence: [{ type: "command", reference: "true" }] }] })}\n\`\`\``;
+      const taskId = "OUTCOME-1";
+      await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt", PI_TOUCH_SECOND: "second.txt", PI_MESSAGE: evidence }, [], JSON.stringify({
+        schema_version: "1.0", task_id: taskId, task_class: "mechanical_refactoring", prompt: "edit", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt", "second.txt"], acceptance_criteria: ["measured"], verification: { commands: ["true"] },
+        iteration: { max_iterations: 1 }, execution_policy: { mode: "fast", risk: "low", max_changed_files: 2, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }));
+      const premature = JSON.parse((await runCli(f.dir, f.env, ["--assess-outcome", taskId])).stdout);
+      assert.equal(premature.error.code, "OUTCOME_ASSESSMENT_FAILED");
+      assert.match(premature.error.message, /decision pending/);
+      const accepted = JSON.parse((await runCli(f.dir, f.env, ["--accept-candidate", taskId])).stdout);
+      assert.equal(accepted.outcome.task_class, "mechanical_refactoring");
+      assert.equal(accepted.outcome.total_worker_tokens, 2);
+      assert.equal(accepted.outcome.total_worker_cost, 0.01);
+      assert.equal(accepted.outcome.attempts, 1);
+      assert.equal(accepted.outcome.iterations, 1);
+      assert.equal(accepted.outcome.first_pass_verification, "passed");
+      assert.equal(accepted.outcome.final_verification, "passed");
+      assert.equal(accepted.outcome.coordinator_decision, "accepted");
+      assert.deepEqual([...accepted.outcome.accepted_files].sort(), ["second.txt", "tracked.txt"]);
+      assert.ok(accepted.outcome.elapsed_ms_to_accepted >= 0);
+      const candidateDir = join(f.dir, ".subagent-exec", "candidates");
+      await writeFile(join(candidateDir, `${taskId}.patch`), await readFile(join(candidateDir, `${taskId}.accepted.patch`)));
+      const conflict = JSON.parse((await runCli(f.dir, f.env, ["--assess-outcome", taskId])).stdout);
+      assert.equal(conflict.error.code, "OUTCOME_ASSESSMENT_FAILED");
+      assert.match(conflict.error.message, /conflicting candidate decision artifacts/);
+      await rm(join(candidateDir, `${taskId}.patch`));
+      const saved = JSON.parse((await runCli(f.dir, f.env, ["--assess-outcome", taskId])).stdout);
+      assert.equal(saved.delegation_outcome, "saved");
+      assert.deepEqual(saved.reworked_files, []);
+      await chmod(join(f.dir, "tracked.txt"), 0o755);
+      const neutral = JSON.parse((await runCli(f.dir, f.env, ["--assess-outcome", taskId])).stdout);
+      assert.equal(neutral.delegation_outcome, "neutral");
+      assert.deepEqual(neutral.reworked_files, ["tracked.txt"]);
+      await writeFile(join(f.dir, "second.txt"), "coordinator rework\n");
+      const amplified = JSON.parse((await runCli(f.dir, f.env, ["--assess-outcome", taskId])).stdout);
+      assert.equal(amplified.delegation_outcome, "amplified");
+      assert.deepEqual([...amplified.reworked_files].sort(), ["second.txt", "tracked.txt"]);
+      const traversal = JSON.parse((await runCli(f.dir, f.env, ["--assess-outcome", "../escape"])).stdout);
+      assert.equal(traversal.error.code, "OUTCOME_ASSESSMENT_FAILED");
+    } finally { await f.cleanup(); }
+  });
+
+  test("does not rewrite a successful accept when outcome persistence fails", async () => {
+    const f = await fixture();
+    const outcomeDir = join(f.dir, ".subagent-exec", "outcomes");
+    try {
+      const evidence = `\`\`\`subagent-evidence\n${JSON.stringify({ criteria: [{ criterion: "accepted", status: "passed", evidence: [{ type: "command", reference: "true" }] }] })}\n\`\`\``;
+      await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt", PI_MESSAGE: evidence }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "OUTCOME-RECOVERY", prompt: "edit", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["accepted"], verification: { commands: ["true"] },
+        iteration: { max_iterations: 1 }, execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }));
+      await chmod(outcomeDir, 0o555);
+      const accepted = JSON.parse((await runCli(f.dir, f.env, ["--accept-candidate", "OUTCOME-RECOVERY"])).stdout);
+      assert.equal(accepted.status, "accepted");
+      assert.ok(accepted.outcome_error);
+      assert.equal(await readFile(join(f.dir, "tracked.txt"), "utf8"), "one\ntwo\n");
+      await writeFile(join(f.dir, "tracked.txt"), "reworked before recovery\n");
+      await chmod(outcomeDir, 0o755);
+      const recovered = JSON.parse((await runCli(f.dir, f.env, ["--assess-outcome", "OUTCOME-RECOVERY"])).stdout);
+      assert.equal(recovered.coordinator_decision, "accepted");
+      assert.equal(recovered.delegation_outcome, "amplified");
+    } finally { await chmod(outcomeDir, 0o755).catch(() => {}); await f.cleanup(); }
+  });
+
+  test("recovers a rejected decision from its durable artifact", async () => {
+    const f = await fixture(); const outcomeDir = join(f.dir, ".subagent-exec", "outcomes");
+    try {
+      const evidence = `\`\`\`subagent-evidence\n${JSON.stringify({ criteria: [{ criterion: "rejectable", status: "passed", evidence: [{ type: "command", reference: "true" }] }] })}\n\`\`\``;
+      await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt", PI_MESSAGE: evidence }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "REJECT-RECOVERY", prompt: "edit", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["rejectable"], verification: { commands: ["true"] },
+        iteration: { max_iterations: 1 }, execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }));
+      await chmod(outcomeDir, 0o555);
+      const rejected = JSON.parse((await runCli(f.dir, f.env, ["--reject-candidate", "REJECT-RECOVERY"])).stdout);
+      assert.equal(rejected.status, "rejected"); assert.ok(rejected.outcome_error);
+      await chmod(outcomeDir, 0o755);
+      const candidateDir = join(f.dir, ".subagent-exec", "candidates");
+      await writeFile(join(candidateDir, "REJECT-RECOVERY.patch"), await readFile(join(candidateDir, "REJECT-RECOVERY.rejected.patch")));
+      const conflict = JSON.parse((await runCli(f.dir, f.env, ["--assess-outcome", "REJECT-RECOVERY"])).stdout);
+      assert.match(conflict.error.message, /conflicting candidate decision artifacts/);
+      await rm(join(candidateDir, "REJECT-RECOVERY.patch"));
+      const recovered = JSON.parse((await runCli(f.dir, f.env, ["--assess-outcome", "REJECT-RECOVERY"])).stdout);
+      assert.equal(recovered.coordinator_decision, "rejected"); assert.equal(recovered.delegation_outcome, "amplified");
+    } finally { await chmod(outcomeDir, 0o755).catch(() => {}); await f.cleanup(); }
   });
 });

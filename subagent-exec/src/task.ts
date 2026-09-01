@@ -22,6 +22,8 @@ const TaskSchema = z.object({
       "task_id must match ^[A-Za-z0-9._:-]+$, max 200 chars"
     ),
 
+  task_class: z.enum(["mechanical_refactoring", "test_generation", "bug_investigation", "small_feature", "cross_module", "other"]).optional(),
+
   // Keeps delegated work packets bounded enough to review and retry safely.
   prompt: z.string().min(1).max(12_000),
 

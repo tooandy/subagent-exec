@@ -86,6 +86,7 @@ import {
 } from "./result.js";
 import { canContinueSession, diagnosticFingerprint, evaluateResultCircuit, failureClass } from "./circuit.js";
 import { acceptCandidate, createCandidateWorktree, discardCandidate, exportCandidatePatch, rejectCandidate } from "./candidate.js";
+import { assessOutcome, fingerprintFiles, recordCoordinatorDecision, recordIteration, recordPersistenceFailure, validateOutcomeTaskId } from "./outcome.js";
 
 import type {
   ExecutionInfo,
@@ -217,6 +218,8 @@ OPTIONS
                      Apply a reviewed candidate patch to the main workspace.
   --reject-candidate <id>
                      Reject a candidate patch without changing the workspace.
+  --assess-outcome <id>
+                     Compare accepted files with their acceptance fingerprints.
   --feedback <path>  Load Continue Task feedback JSON from a file.
   --task-id <id>     Override task_id validation.
   --help, -h         Print this usage message and exit.
@@ -403,6 +406,10 @@ async function persistIterationResult(
     circuit: result.continuation,
     increment_iteration: true
   }));
+  await recordIteration(session.cwd, {
+    schema_version: "1.0", task_id: session.task_id, prompt: session.original_task.prompt,
+    task_class: session.original_task.task_class
+  }, result);
 }
 
 async function persistAndArchiveIfTerminal(session: SessionMetadata, result: WorkerResult): Promise<void> {
@@ -428,7 +435,8 @@ async function prepareCandidateResult(session: SessionMetadata, result: WorkerRe
   if (result.status === "success") {
     try {
       const patchPath = await exportCandidatePatch(session.cwd, worktree, session.task_id);
-      result.candidate = { status: "ready", patch_path: patchPath };
+      result.candidate = { status: "ready", patch_path: patchPath,
+        fingerprints: await fingerprintFiles(worktree, result.scope.changed_files) };
       await discardCandidate(session.cwd, worktree);
       session.candidate_worktree = undefined;
     } catch (error) {
@@ -603,14 +611,32 @@ function classifyStderrLine(line: string): WorkerError | null {
 }
 
 async function main(): Promise<void> {
+  const assessTaskId = getArg("--assess-outcome");
+  if (assessTaskId) {
+    let release: (() => Promise<void>) | null = null;
+    try {
+      validateOutcomeTaskId(assessTaskId);
+      release = await acquireSessionLease(process.cwd(), assessTaskId); if (!release) throw new Error("outcome is busy");
+      printResult(await assessOutcome(process.cwd(), assessTaskId)); process.exitCode = 0;
+    }
+    catch (error) { printResult(createFailedResult(assessTaskId, createError("runtime", "OUTCOME_ASSESSMENT_FAILED", String(error), { retryable: false }), new Date())); process.exitCode = 1; }
+    finally { await release?.(); }
+    return;
+  }
   const rejectTaskId = getArg("--reject-candidate");
   if (rejectTaskId) {
     let release: (() => Promise<void>) | null = null;
     try {
+      validateOutcomeTaskId(rejectTaskId);
       release = await acquireSessionLease(process.cwd(), rejectTaskId);
       if (!release) throw new Error("candidate is busy");
       const rejectedPath = await rejectCandidate(process.cwd(), rejectTaskId);
-      printResult({ schema_version: "1.0", task_id: rejectTaskId, status: "rejected", rejected_patch: rejectedPath });
+      try {
+        const outcome = await recordCoordinatorDecision(process.cwd(), rejectTaskId, "rejected");
+        printResult({ schema_version: "1.0", task_id: rejectTaskId, status: "rejected", rejected_patch: rejectedPath, outcome });
+      } catch (measurementError) {
+        printResult({ schema_version: "1.0", task_id: rejectTaskId, status: "rejected", rejected_patch: rejectedPath, outcome_error: String(measurementError) });
+      }
       process.exitCode = 0;
     } catch (error) {
       printResult(createFailedResult(rejectTaskId, createError("runtime", "CANDIDATE_REJECT_FAILED", String(error), { retryable: false }), new Date()));
@@ -628,7 +654,12 @@ async function main(): Promise<void> {
       release = await acquireSessionLease(process.cwd(), acceptTaskId);
       if (!release) throw new Error("candidate is busy");
       const acceptedPath = await acceptCandidate(process.cwd(), acceptTaskId);
-      printResult({ schema_version: "1.0", task_id: acceptTaskId, status: "accepted", accepted_patch: acceptedPath });
+      try {
+        const outcome = await recordCoordinatorDecision(process.cwd(), acceptTaskId, "accepted");
+        printResult({ schema_version: "1.0", task_id: acceptTaskId, status: "accepted", accepted_patch: acceptedPath, outcome });
+      } catch (measurementError) {
+        printResult({ schema_version: "1.0", task_id: acceptTaskId, status: "accepted", accepted_patch: acceptedPath, outcome_error: String(measurementError) });
+      }
       process.exitCode = 0;
     } catch (error) {
       printResult(createFailedResult(acceptTaskId, createError("runtime", "CANDIDATE_APPLY_FAILED", String(error), { retryable: false }), new Date()));
@@ -850,6 +881,7 @@ async function main(): Promise<void> {
     const synthetic: Task = {
       schema_version: "1.0",
       task_id: continueTask.task_id,
+      task_class: metadata.original_task.task_class,
       prompt: continuePrompt,
       objective: metadata.original_task.objective,
       cwd: metadata.cwd,
@@ -1329,6 +1361,7 @@ async function runIteration(
       await persistAndArchiveIfTerminal(session, result);
     } catch (sessionError) {
       applySessionPersistenceFailure(result, sessionError);
+      try { await recordPersistenceFailure(session.cwd, task, result); } catch { /* primary persistence error remains authoritative */ }
     }
     printResult(result);
 
@@ -1429,6 +1462,7 @@ async function runIteration(
       await persistAndArchiveIfTerminal(session, result);
     } catch (sessionError) {
       applySessionPersistenceFailure(result, sessionError);
+      try { await recordPersistenceFailure(session.cwd, task, result); } catch { /* primary persistence error remains authoritative */ }
     }
     printResult(result);
 
@@ -1802,6 +1836,7 @@ async function runIteration(
       error: String(sessionError)
     });
     applySessionPersistenceFailure(result, sessionError);
+    try { await recordPersistenceFailure(session.cwd, task, result); } catch { /* primary persistence error remains authoritative */ }
   }
 
   printResult(result);

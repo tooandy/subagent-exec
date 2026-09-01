@@ -25,6 +25,7 @@ The Task Contract is supplied to `subagent-exec` either as a JSON file
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `objective` | string | — | High-level intent. **Coordinator-only**; NOT transmitted to the worker. Useful for Codex to track task purpose. |
+| `task_class` | enum | `other` | Cohort for outcome analysis: `mechanical_refactoring`, `test_generation`, `bug_investigation`, `small_feature`, `cross_module`, or `other`. |
 | `cwd` | string | process cwd | Working directory for the worker. |
 | `scope` | enum | `read_write` | `read_only` or `read_write`. In `read_only` mode any file creation, modification, or deletion fails the task regardless of `allowed_paths`. |
 | `allowed_paths` | string[] (glob) | `[]` | Files/directories the worker may modify. `read_write` + empty = scope not checked. `read_only` + any value = ANY change is a violation. |
@@ -438,6 +439,18 @@ the artifact to `.rejected.patch` without touching the checkout. Non-empty
 candidates become ready only when every acceptance criterion has reproducible
 `passed` evidence. Scope and budgets are recomputed after verification so
 verification side effects cannot enter an unchecked patch.
+
+### outcome measurement
+
+Each completed Worker round atomically updates
+`.subagent-exec/outcomes/<task_id>.json`. It records task class, attempts,
+iterations, cumulative Worker tokens and cost, first/final verification,
+scope-violation count, elapsed time, terminal reason, and coordinator decision.
+Acceptance fingerprints every applied candidate file and starts as `neutral`.
+Run `subagent-exec --assess-outcome <task_id>` after subsequent coordinator work:
+no reworked accepted files is `saved`, partial rework is `neutral`, and complete
+rework is `amplified`. Rejection and terminal failure are immediately
+`amplified`.
 
 ---
 

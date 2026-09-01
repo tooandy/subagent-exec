@@ -266,6 +266,11 @@ The final result contains:
 - validation
 - error when applicable
 
+After accepting or rejecting a candidate, preserve the returned outcome record.
+Once coordinator follow-up work is complete, run
+`subagent-exec --assess-outcome <task_id>` so saved effort is measured rather
+than assumed. Set `task_class` on new tasks to support cohort-level tuning.
+
 See `CONTRACT.md` for the exact Result Contract.
 
 ## Worker Status

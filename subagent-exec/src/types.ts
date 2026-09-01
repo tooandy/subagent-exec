@@ -60,6 +60,8 @@ export interface Task {
 
   task_id: string;
 
+  task_class?: "mechanical_refactoring" | "test_generation" | "bug_investigation" | "small_feature" | "cross_module" | "other";
+
   objective?: string;
 
   /**
@@ -189,6 +191,7 @@ export interface SessionMetadata {
    * commands don't need to resupply cwd/timeout/etc.
    */
   original_task: {
+    task_class?: "mechanical_refactoring" | "test_generation" | "bug_investigation" | "small_feature" | "cross_module" | "other";
     objective?: string;
     prompt: string;
     scope?: "read_only" | "read_write";
@@ -360,6 +363,7 @@ export interface WorkerResult {
   candidate?: {
     status: "pending" | "ready" | "discarded";
     patch_path?: string;
+    fingerprints?: Record<string, string>;
   };
 
   usage?: UsageInfo;

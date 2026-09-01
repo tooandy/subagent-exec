@@ -21,6 +21,7 @@ It owns:
 - JSONL RPC transport
 - Timeout (per-task) and cancellation (SIGINT/SIGTERM)
 - Token / cost usage capture
+- Per-task delegation outcome and coordinator-rework measurement
 - Workspace scope verification
 - Disposable write candidates with OS-contained Worker and verification processes
 - Verification command execution

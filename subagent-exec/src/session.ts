@@ -57,6 +57,7 @@ const SessionMetadataSchema = z.object({
   created_at: z.string().datetime(),
   updated_at: z.string().datetime(),
   original_task: z.object({
+    task_class: z.enum(["mechanical_refactoring", "test_generation", "bug_investigation", "small_feature", "cross_module", "other"]).optional(),
     objective: z.string().optional(),
     prompt: z.string().min(1),
     scope: z.enum(["read_only", "read_write"]).optional(),
@@ -235,6 +236,7 @@ export function newSessionMetadata(task: Task): SessionMetadata {
     created_at: now,
     updated_at: now,
     original_task: {
+      task_class: task.task_class,
       objective: task.objective,
       prompt: task.prompt,
       scope: task.scope,

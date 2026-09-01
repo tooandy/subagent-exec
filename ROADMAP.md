@@ -231,6 +231,20 @@ Evaluate results by task class, such as mechanical refactoring, test generation,
 bug investigation, small feature implementation, and cross-module work. Use
 observed results to tune admission rules and budgets.
 
+### Phase 6 exit criteria
+
+- Every completed round atomically updates a per-task outcome record under
+  `.subagent-exec/outcomes/` with cumulative tokens, cost, attempts, iteration,
+  verification, scope, elapsed time, and terminal reason.
+- Task contracts may declare a stable `task_class` for cohort analysis.
+- Accept and reject commands record the coordinator decision; acceptance stores
+  file fingerprints and initially remains `neutral` pending observation.
+- `--assess-outcome <task_id>` compares accepted fingerprints with the current
+  checkout and classifies no rework as `saved`, partial rework as `neutral`, and
+  complete rework or rejection/terminal failure as `amplified`.
+- Contract, guidance, and tests cover successful acceptance, rejection, token
+  aggregation, and subsequent coordinator rework.
+
 ## Immediate implementation milestone
 
 The next development milestone is limited to Phase 1:

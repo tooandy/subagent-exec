@@ -31,6 +31,7 @@ The Task Contract is supplied to `subagent-exec` either as a JSON file
 | `constraints` | string[] | `[]` | Implementation constraints sent to worker as a fixed `### CONSTRAINTS` section. Each entry becomes a bullet point. |
 | `acceptance_criteria` | string[] | `[]` | Acceptance criteria sent to worker as a fixed `### ACCEPTANCE CRITERIA` section. Each entry becomes a bullet point. |
 | `verification` | object | — | Commands to run after worker completes (see below). |
+| `iteration` | object | `{ max_iterations: 2 }` | Bounded session rounds. `max_iterations` is 1–3 and includes the first round. |
 | `model` | object | — | `{ provider, model }` forwarded to worker runtime. |
 | `timeout_ms` | number | 900000 | Max execution time in ms. Max 24h (86400000). |
 | `metadata` | object | — | Free-form data passed through to the Result. |
@@ -62,6 +63,42 @@ overwrite constraints by editing the prompt.
 | --- | --- | --- |
 | `commands` | string[] | Shell commands to run after worker finishes. Fail-fast on first failure. |
 | `timeout_ms` | number | Per-command timeout (default 120000). |
+
+### iteration sub-object
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `max_iterations` | integer | Total rounds including the first invocation. Defaults to 2; maximum 3. |
+
+## 1.1 Continue Task Contract
+
+Continuation is supplied with `--continue <task_id>` and either
+`--feedback <path>` or JSON on stdin:
+
+```json
+{
+  "schema_version": "1.0",
+  "task_id": "AUTH-001",
+  "action": "continue",
+  "feedback": "Fix the failing refresh-token test",
+  "timeout_ms": 300000
+}
+```
+
+Only feedback and an optional per-round timeout are accepted. Working directory,
+scope, constraints, acceptance criteria, verification, model, and iteration
+policy are restored from validated runtime metadata. The runtime resumes the
+exact Pi session ID assigned to the task; it never selects the most recent
+session implicitly.
+
+Verification is rerun after every continuation that reaches post-worker
+processing, including rounds with a scope or worker-result error. An earlier
+primary error is preserved if verification also fails. A round terminated by
+timeout, cancellation, prompt rejection, or process exit before post-worker
+processing reports verification as `not_run`.
+
+Runtime state is stored under `<cwd>/.subagent-exec/`: contract metadata in
+`metadata/` and Pi transcripts in `pi-sessions/`. Metadata writes are atomic.
 
 ### Examples
 
@@ -115,6 +152,7 @@ overwrite constraints by editing the prompt.
 | `scope` | object | Workspace scope verification. |
 | `verification` | object | Verification command results. |
 | `usage` | object or null | Token / cost usage (may be null if unavailable). |
+| `iteration` | integer | Current one-based session round. |
 | `error` | object or null | Structured error when status != success. |
 | `metadata` | object | Echoed from Task Contract. |
 
@@ -202,7 +240,8 @@ self-report.
 }
 ```
 
-`status` = `not_run` when `verification.commands` was empty.
+`status` = `not_run` when `verification.commands` was empty or the round ended
+before post-worker verification could safely begin.
 
 ### usage
 

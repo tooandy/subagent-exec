@@ -160,6 +160,11 @@ describe("parseTask", () => {
     }, /timeout_ms/);
   });
 
+  test("accepts max_iterations 3 and rejects 4", () => {
+    assert.equal(parseTask({ schema_version: "1.0", task_id: "x", prompt: "x", iteration: { max_iterations: 3 } }).iteration?.max_iterations, 3);
+    assert.throws(() => parseTask({ schema_version: "1.0", task_id: "x", prompt: "x", iteration: { max_iterations: 4 } }));
+  });
+
   test("accepts task_id at max length (200 chars)", () => {
     const task = parseTask({
       schema_version: "1.0",

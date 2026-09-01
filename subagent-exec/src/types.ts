@@ -33,8 +33,8 @@ export interface IterationConfig {
   /**
    * Maximum number of (prompt, response) rounds within a single
    * task session. The first prompt counts as iteration 1.
-   * Default 1 means: start task, no continue. Set to 3 to
-   * allow Worker self-check + Codex review + one fix.
+   * Defaults to 2 and is capped at 3. The first prompt counts as
+   * iteration 1, so the default permits one bounded repair round.
    */
   max_iterations?: number;
 }
@@ -44,7 +44,7 @@ export interface Task {
 
   task_id: string;
 
-  objective: string;
+  objective?: string;
 
   /**
    * Self-contained instruction sent to the worker.
@@ -58,8 +58,6 @@ export interface Task {
    * High-level intent. Coordinator-only field; NOT transmitted to the worker.
    * Useful for Codex to track why a task was created.
    */
-  objective_?: string;
-
   cwd?: string;
 
   scope?: "read_only" | "read_write";
@@ -124,14 +122,14 @@ export interface SessionMetadata {
    * The worker runtime's session handle (e.g. Pi's session UUID).
    * Used to spawn `--session <id>` on subsequent iterations.
    */
-  worker_session_id?: string;
+  worker_session_id: string;
 
   /**
    * Path to the worker's session storage directory (e.g. Pi's
    * ~/.pi/sessions/<project>/<id>). Used to disambiguate when
    * multiple tasks share a worker session namespace.
    */
-  worker_session_dir?: string;
+  worker_session_dir: string;
 
   /**
    * Number of (prompt, response) rounds completed so far.
@@ -164,12 +162,14 @@ export interface SessionMetadata {
    * commands don't need to resupply cwd/timeout/etc.
    */
   original_task: {
-    objective: string;
+    objective?: string;
     prompt: string;
     scope?: "read_only" | "read_write";
     allowed_paths?: string[];
     constraints?: string[];
     acceptance_criteria?: string[];
+    verification?: VerificationConfig;
+    iteration?: IterationConfig;
     model?: TaskModel;
     timeout_ms?: number;
     metadata?: Record<string, unknown>;

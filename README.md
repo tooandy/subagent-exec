@@ -1,6 +1,6 @@
 # subagent-exec
 
-A stateless Worker Runtime that gives Codex (or any orchestrating agent) a
+A bounded Worker Runtime that gives Codex (or any orchestrating agent) a
 reliable, machine-parseable interface for delegating concrete coding tasks
 to an external worker agent.
 
@@ -10,6 +10,10 @@ to an external worker agent.
 runs the task to completion or failure, and emits one strict-JSON
 Result Contract on stdout. Realtime JSONL lifecycle events are written
 to stderr.
+
+Tasks may be continued with coordinator feedback in the exact Pi session that
+executed the first round. Continuation is bounded to two rounds by default and
+three at most.
 
 It owns:
 
@@ -70,6 +74,17 @@ Verify:
 pi --version
 subagent-exec --task examples/task.json
 ```
+
+Continue an existing task:
+
+```bash
+subagent-exec --continue TASK-123 --feedback feedback.json
+```
+
+Runtime metadata and Pi transcripts live separately under
+`<cwd>/.subagent-exec/{metadata,pi-sessions}`. This directory can contain full
+prompts and worker output, is ignored by Git, and should be removed or archived
+according to the workspace's data-retention policy.
 
 ## Run
 

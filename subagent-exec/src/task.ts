@@ -62,7 +62,7 @@ const TaskSchema = z.object({
         .number()
         .int()
         .positive()
-        .max(10)
+        .max(3)
         .optional()
     })
     .optional(),
@@ -106,6 +106,7 @@ const ContinueTaskSchema = z.object({
     .number()
     .int()
     .positive()
+    .max(24 * 60 * 60 * 1000)
     .optional(),
 
   metadata: z

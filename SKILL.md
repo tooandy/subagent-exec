@@ -1,13 +1,13 @@
 ---
 name: subagent-exec
-description: Delegate a self-contained implementation, testing, investigation, refactoring, or review task to a stateless external worker agent, then validate its structured result and workspace scope.
+description: Delegate a bounded implementation, testing, investigation, refactoring, or review task to an external worker session, then validate its structured result and workspace scope.
 ---
 
 # Subagent Worker Skill
 
 ## Purpose
 
-`subagent-exec` is the standard worker gateway for delegating concrete
+`subagent-exec` is the standard bounded worker gateway for delegating concrete
 implementation, investigation, testing, refactoring, or review tasks to
 an external coding agent.
 
@@ -400,16 +400,18 @@ The worker runtime currently follows:
 ```
 one task
   =
-one worker process
+one exact persisted worker session
   =
-one stateless session
+one initial round plus bounded coordinator feedback
 ```
 
-Do not assume session state survives between invocations.
+The first task must remain self-contained. A continuation may rely on the exact
+persisted session identified by the runtime, but must only provide focused
+review feedback. Do not use continuation as an unbounded retry loop: the default
+limit is two total rounds and the hard maximum is three.
 
-Do not rely on previous worker conversations.
-
-Every task must contain all necessary context.
+The runtime stores metadata and Pi transcripts below `.subagent-exec/`. Treat
+that directory as sensitive runtime state and never commit it.
 
 ## Cost Control
 

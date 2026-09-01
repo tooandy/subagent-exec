@@ -15,23 +15,48 @@ export interface PiProcess {
 export interface SpawnOptions {
   /**
    * Existing session to continue. When provided, Pi is spawned
-   * with --continue and the previous session's full conversation
+   * with --session and the previous session's full conversation
    * history is loaded.
    */
   continueFrom?: SessionMetadata;
 
   /**
    * Directory where Pi stores session files. subagent-exec passes
-   * its own session dir so Pi's sessions are co-located with
-   * subagent-exec's metadata.
+   * a dedicated Pi transcript directory separate from metadata.
    */
   sessionDir?: string;
+
+  /** Exact id used when creating a fresh Pi session. */
+  sessionId?: string;
 }
 
 export function spawnPi(
   task: Task,
   options: SpawnOptions = {}
 ): PiProcess {
+  const args = buildPiArgs(task, options);
+
+  const child = spawn(
+    "pi",
+    args,
+    {
+      cwd: task.cwd ?? process.cwd(),
+      stdio: ["pipe", "pipe", "pipe"],
+      env: process.env
+    }
+  );
+
+  if (!child.pid) {
+    throw new Error("Failed to obtain Pi process PID");
+  }
+
+  return { child, pid: child.pid };
+}
+
+export function buildPiArgs(
+  task: Task,
+  options: SpawnOptions = {}
+): string[] {
   const args: string[] = [];
 
   /*
@@ -42,25 +67,18 @@ export function spawnPi(
 
   if (options.continueFrom) {
     /*
-     * Resume the previous session. --continue tells Pi to look
-     * up the most recent session in --session-dir; --session
-     * explicitly targets the recorded session_id when known.
+     * Resume only the session recorded for this task.
      */
-    args.push("--continue");
-
-    if (options.continueFrom.worker_session_id) {
-      args.push(
-        "--session",
-        options.continueFrom.worker_session_id
-      );
-    }
+    args.push("--session", options.continueFrom.worker_session_id);
   } else {
     /*
-     * Fresh session: do NOT use --no-session because we WANT Pi
-     * to persist the session so a future --continue can resume
-     * the conversation. subagent-exec records the session_id
-     * to its own metadata after the first prompt is accepted.
+     * Create an exact task-specific session so future continuation
+     * does not depend on the most recently used session.
      */
+    if (!options.sessionId) {
+      throw new Error("A sessionId is required for a fresh Pi session");
+    }
+    args.push("--session-id", options.sessionId);
   }
 
   if (options.sessionDir) {
@@ -75,24 +93,5 @@ export function spawnPi(
     args.push("--model", task.model.model);
   }
 
-  const child = spawn(
-    "pi",
-    args,
-    {
-      cwd: task.cwd ?? process.cwd(),
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env
-    }
-  );
-
-  if (!child.pid) {
-    throw new Error(
-      "Failed to obtain Pi process PID"
-    );
-  }
-
-  return {
-    child,
-    pid: child.pid
-  };
+  return args;
 }

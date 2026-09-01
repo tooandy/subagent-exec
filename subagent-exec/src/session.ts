@@ -1,6 +1,7 @@
 import {
   readFile,
   writeFile,
+  rename,
   mkdir,
   unlink,
   access
@@ -12,6 +13,9 @@ import {
   dirname
 } from "node:path";
 
+import { randomUUID } from "node:crypto";
+import { z } from "zod";
+
 import type {
   SessionMetadata,
   Task
@@ -21,23 +25,69 @@ import type {
 export type { SessionMetadata };
 
 const SESSION_DIRNAME = ".subagent-exec";
+const METADATA_DIRNAME = "metadata";
+const PI_SESSION_DIRNAME = "pi-sessions";
+
+const SessionMetadataSchema = z.object({
+  schema_version: z.literal("1.0"),
+  task_id: z.string().min(1).max(200).regex(/^[A-Za-z0-9._:-]+$/),
+  worker_session_id: z.string().uuid(),
+  worker_session_dir: z.string().min(1),
+  iteration: z.number().int().min(0).max(3),
+  last_result: z.object({
+    status: z.enum(["success", "failed", "cancelled", "timeout", "needs_continuation"]),
+    summary: z.string().optional(),
+    changed_files: z.array(z.string())
+  }).optional(),
+  cwd: z.string().min(1),
+  created_at: z.string().datetime(),
+  updated_at: z.string().datetime(),
+  original_task: z.object({
+    objective: z.string().optional(),
+    prompt: z.string().min(1),
+    scope: z.enum(["read_only", "read_write"]).optional(),
+    allowed_paths: z.array(z.string()).optional(),
+    constraints: z.array(z.string()).optional(),
+    acceptance_criteria: z.array(z.string()).optional(),
+    verification: z.object({
+      commands: z.array(z.string()).optional(),
+      timeout_ms: z.number().int().positive().optional()
+    }).optional(),
+    iteration: z.object({
+      max_iterations: z.number().int().positive().max(3).optional()
+    }).optional(),
+    model: z.object({
+      provider: z.string().optional(),
+      model: z.string().optional()
+    }).optional(),
+    timeout_ms: z.number().int().positive().optional(),
+    metadata: z.record(z.string(), z.unknown()).optional()
+  })
+});
 
 /**
  * Resolve the session directory.
  *
  * Priority:
  * 1. SUBAGENT_EXEC_SESSION_DIR environment variable
- * 2. <cwd>/.subagent-exec/  (per-project session storage)
+ * 2. <cwd>/.subagent-exec/  (per-project runtime storage)
  *
  * Per-project storage means sessions live next to the worker's
- * working directory, which matches Pi's own session layout and
- * makes sessions discoverable to humans running `ls .subagent-exec/`.
+ * working directory. Metadata and Pi transcripts use separate children.
  */
-export function resolveSessionDir(cwd: string): string {
+export function resolveRuntimeDir(cwd: string): string {
   if (process.env.SUBAGENT_EXEC_SESSION_DIR) {
     return process.env.SUBAGENT_EXEC_SESSION_DIR;
   }
   return join(resolve(cwd), SESSION_DIRNAME);
+}
+
+export function resolveMetadataDir(cwd: string): string {
+  return join(resolveRuntimeDir(cwd), METADATA_DIRNAME);
+}
+
+export function resolvePiSessionDir(cwd: string): string {
+  return join(resolveRuntimeDir(cwd), PI_SESSION_DIRNAME);
 }
 
 function sessionPath(
@@ -51,7 +101,7 @@ export async function loadSession(
   cwd: string,
   taskId: string
 ): Promise<SessionMetadata | null> {
-  const path = sessionPath(resolveSessionDir(cwd), taskId);
+  const path = sessionPath(resolveMetadataDir(cwd), taskId);
 
   try {
     await access(path);
@@ -62,15 +112,7 @@ export async function loadSession(
   const text = await readFile(path, "utf8");
 
   try {
-    const data = JSON.parse(text) as SessionMetadata;
-
-    if (data.schema_version !== "1.0") {
-      throw new Error(
-        `unsupported session schema_version: ${data.schema_version}`
-      );
-    }
-
-    return data;
+    return SessionMetadataSchema.parse(JSON.parse(text)) as SessionMetadata;
   } catch (error) {
     throw new Error(
       `failed to parse session file ${path}: ${String(error)}`
@@ -81,16 +123,27 @@ export async function loadSession(
 export async function saveSession(
   metadata: SessionMetadata
 ): Promise<string> {
-  const sessionDir = resolveSessionDir(metadata.cwd);
+  const sessionDir = resolveMetadataDir(metadata.cwd);
   await mkdir(sessionDir, { recursive: true });
 
   const path = sessionPath(sessionDir, metadata.task_id);
 
-  await writeFile(
-    path,
-    JSON.stringify(metadata, null, 2),
-    "utf8"
-  );
+  const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(
+      tempPath,
+      JSON.stringify(metadata, null, 2),
+      "utf8"
+    );
+    await rename(tempPath, path);
+  } catch (error) {
+    try {
+      await unlink(tempPath);
+    } catch {
+      // The write may have failed before creating the temporary file.
+    }
+    throw error;
+  }
 
   return path;
 }
@@ -99,7 +152,7 @@ export async function deleteSession(
   cwd: string,
   taskId: string
 ): Promise<void> {
-  const path = sessionPath(resolveSessionDir(cwd), taskId);
+  const path = sessionPath(resolveMetadataDir(cwd), taskId);
   try {
     await unlink(path);
   } catch {
@@ -113,9 +166,11 @@ export async function deleteSession(
 export function newSessionMetadata(task: Task): SessionMetadata {
   const now = new Date().toISOString();
 
-  return {
+  return SessionMetadataSchema.parse({
     schema_version: "1.0",
     task_id: task.task_id,
+    worker_session_id: randomUUID(),
+    worker_session_dir: resolvePiSessionDir(task.cwd ?? process.cwd()),
     iteration: 0,
     cwd: task.cwd ?? process.cwd(),
     created_at: now,
@@ -127,11 +182,13 @@ export function newSessionMetadata(task: Task): SessionMetadata {
       allowed_paths: task.allowed_paths,
       constraints: task.constraints,
       acceptance_criteria: task.acceptance_criteria,
+      verification: task.verification,
+      iteration: task.iteration,
       model: task.model,
       timeout_ms: task.timeout_ms,
       metadata: task.metadata
     }
-  };
+  }) as SessionMetadata;
 }
 
 /**

@@ -28,7 +28,7 @@ import {
   deleteSession,
   newSessionMetadata,
   withIteration,
-  resolveSessionDir
+  resolvePiSessionDir
 } from "./session.js";
 
 import type { SessionMetadata } from "./session.js";
@@ -81,7 +81,8 @@ import type {
   Task,
   VerificationResult,
   WorkerError,
-  WorkerInfo
+  WorkerInfo,
+  WorkerResult
 } from "./types.js";
 
 const DEFAULT_TIMEOUT =
@@ -191,7 +192,7 @@ async function loadContinueInput(): Promise<unknown> {
 
 function printUsage(): void {
   const msg = `
-subagent-exec — stateless Pi RPC worker runner
+subagent-exec — bounded Pi RPC worker runtime
 
 USAGE
   subagent-exec [options]
@@ -199,6 +200,8 @@ USAGE
 OPTIONS
   --task <path>      Load Task Contract from a JSON file.
                      If omitted, reads from stdin.
+  --continue <id>    Continue the exact persisted session for task id.
+  --feedback <path>  Load Continue Task feedback JSON from a file.
   --task-id <id>     Override task_id validation.
   --help, -h         Print this usage message and exit.
 
@@ -348,6 +351,35 @@ function createFailedResult(
     verification: createDefaultVerification(),
     error
   };
+}
+
+async function persistIterationResult(
+  session: SessionMetadata,
+  result: WorkerResult
+): Promise<void> {
+  await saveSession(withIteration(session, {
+    worker_session_id: session.worker_session_id,
+    worker_session_dir: session.worker_session_dir,
+    last_result: {
+      status: result.status,
+      summary: result.result.summary,
+      changed_files: result.result.changed_files
+    },
+    increment_iteration: true
+  }));
+}
+
+function applySessionPersistenceFailure(
+  result: WorkerResult,
+  error: unknown
+): void {
+  result.status = "failed";
+  result.error = createError(
+    "runtime",
+    "SESSION_PERSISTENCE_FAILED",
+    `Failed to persist continuation state: ${String(error)}`,
+    { retryable: false }
+  );
 }
 
 /*
@@ -567,13 +599,7 @@ async function main(): Promise<void> {
     /*
      * Enforce max_iterations from the original task.
      */
-    const maxIter =
-      metadata.original_task.metadata?.max_iterations as number | undefined;
-    const defaultMaxIter = 3;
-    const limit =
-      typeof maxIter === "number" && maxIter > 0
-        ? maxIter
-        : defaultMaxIter;
+    const limit = metadata.original_task.iteration?.max_iterations ?? 2;
 
     if (metadata.iteration >= limit) {
       printResult(
@@ -619,6 +645,8 @@ async function main(): Promise<void> {
       allowed_paths: metadata.original_task.allowed_paths,
       constraints: metadata.original_task.constraints,
       acceptance_criteria: metadata.original_task.acceptance_criteria,
+      verification: metadata.original_task.verification,
+      iteration: metadata.original_task.iteration,
       model: metadata.original_task.model,
       timeout_ms:
         continueTask.timeout_ms ??
@@ -712,8 +740,7 @@ async function runIteration(
    */
   /*
    * Resolve cwd to absolute path BEFORE creating session metadata.
-   * This ensures that resolveSessionDir() finds the same .subagent-exec
-   * directory on subsequent --continue invocations regardless of cwd.
+   * This keeps the task workspace stable across continuation rounds.
    */
   const cwd = existingSession
     ? existingSession.cwd
@@ -771,7 +798,8 @@ async function runIteration(
       { ...task, cwd },
       {
         continueFrom: existingSession,
-        sessionDir: resolveSessionDir(cwd)
+        sessionDir: existingSession?.worker_session_dir ?? resolvePiSessionDir(cwd),
+        sessionId: session.worker_session_id
       }
     );
     rpc = new PiRpcClient(pi.child);
@@ -925,7 +953,12 @@ async function runIteration(
   try {
     logger.log("prompt_sent");
 
-    const response = await rpc.prompt(workerPrompt);
+    const response = await Promise.race([
+      rpc.prompt(workerPrompt),
+      childExitPromise,
+      timeoutPromise,
+      cancellationPromise
+    ]);
 
     if (!response.success) {
       throw protocolError(
@@ -939,8 +972,24 @@ async function runIteration(
     removeRpcListener();
     cleanupRace();
 
-    workerError =
-      error instanceof ClassifiedError
+    if (error instanceof TimeoutError) {
+      timeoutTriggered = true;
+      workerError = createError(
+        "runtime",
+        "TASK_TIMEOUT",
+        `Task exceeded ${timeoutMs}ms`,
+        { retryable: true }
+      );
+    } else if (error instanceof CancelledError) {
+      workerError = createError(
+        "runtime",
+        "TASK_CANCELLED",
+        `Task cancelled by ${error.signal}`,
+        { retryable: false }
+      );
+    } else {
+      workerError =
+        error instanceof ClassifiedError
         ? createError(
             error.category,
             error.code,
@@ -948,11 +997,11 @@ async function runIteration(
             { retryable: error.retryable }
           )
         : classifyError(error);
+    }
 
     await shutdownPi(pi, rpc, logger);
 
-    printResult(
-      buildResult(
+    const result = buildResult(
         task,
         { runtime: "pi" },
         {
@@ -977,10 +1026,19 @@ async function runIteration(
         createDefaultVerification(),
         workerError,
         iterationNumber
-      )
-    );
+      );
+    try {
+      await persistIterationResult(session, result);
+    } catch (sessionError) {
+      applySessionPersistenceFailure(result, sessionError);
+    }
+    printResult(result);
 
-    process.exitCode = 1;
+    process.exitCode = timeoutTriggered
+      ? 124
+      : error instanceof CancelledError
+        ? 130
+        : 1;
     return;
   }
 
@@ -1041,8 +1099,7 @@ async function runIteration(
 
     await shutdownPi(pi, rpc, logger);
 
-    printResult(
-      buildResult(
+    const result = buildResult(
         task,
         { runtime: "pi" },
         {
@@ -1067,8 +1124,13 @@ async function runIteration(
         createDefaultVerification(),
         workerError,
         iterationNumber
-      )
-    );
+      );
+    try {
+      await persistIterationResult(session, result);
+    } catch (sessionError) {
+      applySessionPersistenceFailure(result, sessionError);
+    }
+    printResult(result);
 
     process.exitCode = timeoutTriggered ? 124 : 130;
     return;
@@ -1281,10 +1343,7 @@ async function runIteration(
 
   let verification = createDefaultVerification();
 
-  if (
-    !workerError &&
-    task.verification?.commands?.length
-  ) {
+  if (task.verification?.commands?.length) {
     const verifyTimeout =
       task.verification.timeout_ms ??
       DEFAULT_VERIFY_TIMEOUT;
@@ -1311,7 +1370,7 @@ async function runIteration(
       };
     }
 
-    if (verification.status === "failed") {
+    if (verification.status === "failed" && !workerError) {
       workerError = createError(
         "verification",
         "VERIFICATION_FAILED",
@@ -1354,56 +1413,21 @@ async function runIteration(
     iterationNumber
   );
 
+  try {
+    await persistIterationResult(session, result);
+  } catch (sessionError) {
+    logger.log("session_save_failed", {
+      error: String(sessionError)
+    });
+    applySessionPersistenceFailure(result, sessionError);
+  }
+
   printResult(result);
 
   logger.log("task_finished", {
     status: result.status,
     iteration: iterationNumber
   });
-
-  /*
-   * Persist session for continuation.
-   *
-   * If this iteration succeeded AND the task didn't already exceed
-   * max_iterations, save the new metadata. Codex can then issue
-   * `subagent-exec --continue <task_id> --feedback <file>` to
-   * resume the same Pi session.
-   *
-   * If the task failed (timeout, scope violation, etc.), we still
-   * save the session so Codex can decide whether to retry.
-   */
-  try {
-    const piSessionId = pi.child.pid
-      ? undefined // populated lazily below if available
-      : undefined;
-    void piSessionId;
-
-    /*
-     * If Pi's RPC layer exposes the session id via a get_session
-     * response, capture it here. For now we leave worker_session_id
-     * as whatever the previous metadata had — Pi's --continue
-     * reuses the most recent session in --session-dir anyway.
-     */
-    const updatedSession = withIteration(
-      session,
-      {
-        worker_session_id:
-          session.worker_session_id,
-        worker_session_dir: resolveSessionDir(cwd),
-        last_result: {
-          status: result.status,
-          summary: result.result.summary,
-          changed_files: result.result.changed_files
-        },
-        increment_iteration: true
-      }
-    );
-    await saveSession(updatedSession);
-  } catch (sessionError) {
-    logger.log("session_save_failed", {
-      error: String(sessionError)
-    });
-  }
 
   process.exitCode =
     result.status === "success"

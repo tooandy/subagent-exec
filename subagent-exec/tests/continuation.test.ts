@@ -55,6 +55,9 @@ process.stdin.on("data", (chunk) => {
       }
       if (process.env.PI_MUTATION_MODE === "delete") fs.unlinkSync("tracked.txt");
       if (process.env.PI_MUTATION_MODE === "rename") fs.renameSync("tracked.txt", "renamed.txt");
+      if (process.env.PI_MUTATION_MODE === "first-line") {
+        const lines = fs.readFileSync("multi.txt", "utf8").split("\\n"); lines[0] = "worker-first"; fs.writeFileSync("multi.txt", lines.join("\\n"));
+      }
       if (process.env.PI_MUTATION_MODE === "escape-symlink") fs.symlinkSync(process.env.PI_SYMLINK_TARGET, "escape-link");
       process.stdout.write(JSON.stringify({type:"response",id:command.id,success:true})+"\\n");
       if (process.env.PI_EXIT_EARLY) process.exit(7);
@@ -65,7 +68,7 @@ process.stdin.on("data", (chunk) => {
         process.stdout.write(JSON.stringify({type:"agent_settled"})+"\\n");
       }
     } else if (command.type === "get_session_stats") {
-      process.stdout.write(JSON.stringify({type:"response",id:command.id,success:true,data:{tokens:{input:1,output:1,cacheRead:0,cacheWrite:0},cost:0.01}})+"\\n");
+      process.stdout.write(JSON.stringify({type:"response",id:command.id,success:true,data:{tokens:{input:Number(process.env.PI_INPUT_TOKENS || 1),output:1,cacheRead:0,cacheWrite:0},cost:Number(process.env.PI_COST || 0.01)}})+"\\n");
     } else if (command.type === "abort") {
       process.stdout.write(JSON.stringify({type:"response",id:command.id,success:true})+"\\n");
       setTimeout(() => process.exit(0), 5);
@@ -78,7 +81,8 @@ process.stdin.on("data", (chunk) => {
   execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dir });
   execFileSync("git", ["config", "user.name", "Test"], { cwd: dir });
   await writeFile(join(dir, "tracked.txt"), "base", "utf8");
-  execFileSync("git", ["add", "tracked.txt"], { cwd: dir });
+  await writeFile(join(dir, "multi.txt"), Array.from({ length: 20 }, (_, index) => `line-${index + 1}`).join("\n") + "\n", "utf8");
+  execFileSync("git", ["add", "tracked.txt", "multi.txt"], { cwd: dir });
   execFileSync("git", ["commit", "-qm", "init"], { cwd: dir });
   return {
     dir,
@@ -573,9 +577,9 @@ describe("continuation CLI integration", () => {
         scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["passes"], verification: { commands: [command] },
         iteration: { max_iterations: 3 }, execution_policy: { mode: "checkpoint", risk: "medium", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" } };
       await runCli(f.dir, f.env, [], JSON.stringify(task));
-      const first = JSON.parse((await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt", PI_MESSAGE: evidence }, ["--continue", "CANDIDATE-REPAIR"], JSON.stringify({ schema_version: "1.0", task_id: "CANDIDATE-REPAIR", action: "continue", feedback: "implement" }))).stdout);
+      const first = JSON.parse((await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt", PI_MESSAGE: evidence, PI_INPUT_TOKENS: "3", PI_COST: "0.02" }, ["--continue", "CANDIDATE-REPAIR"], JSON.stringify({ schema_version: "1.0", task_id: "CANDIDATE-REPAIR", action: "continue", feedback: "implement" }))).stdout);
       assert.equal(first.candidate.status, "pending");
-      const repaired = JSON.parse((await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt", PI_MESSAGE: evidence }, ["--continue", "CANDIDATE-REPAIR"], JSON.stringify({ schema_version: "1.0", task_id: "CANDIDATE-REPAIR", action: "continue", feedback: "repair" }))).stdout);
+      const repaired = JSON.parse((await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt", PI_MESSAGE: evidence, PI_INPUT_TOKENS: "5", PI_COST: "0.03" }, ["--continue", "CANDIDATE-REPAIR"], JSON.stringify({ schema_version: "1.0", task_id: "CANDIDATE-REPAIR", action: "continue", feedback: "repair" }))).stdout);
       assert.equal(repaired.status, "success");
       assert.equal(repaired.candidate.status, "ready");
       assert.equal(await readFile(join(f.dir, "tracked.txt"), "utf8"), "base");
@@ -811,6 +815,44 @@ describe("continuation CLI integration", () => {
       const rejectTraversal = await runCli(f.dir, f.env, ["--reject-candidate", "../escape"]);
       assert.equal(JSON.parse(rejectTraversal.stdout).error.code, "CANDIDATE_REJECT_FAILED");
       await assert.rejects(() => readFile(join(f.dir, ".subagent-exec", "escape.json"), "utf8"));
+    } finally { await f.cleanup(); }
+  });
+
+  test("refuses a candidate when its main-checkout path has a nonconflicting dirty hunk", async () => {
+    const f = await fixture();
+    try {
+      const evidence = `\`\`\`subagent-evidence\n${JSON.stringify({ criteria: [{ criterion: "edit", status: "passed", evidence: [{ type: "command", reference: "true" }] }] })}\n\`\`\``;
+      await runCli(f.dir, { ...f.env, PI_MUTATION_MODE: "first-line", PI_MESSAGE: evidence }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "DIRTY-HUNK", prompt: "edit", cwd: f.dir, scope: "read_write", allowed_paths: ["multi.txt"],
+        acceptance_criteria: ["edit"], verification: { commands: ["true"] }, iteration: { max_iterations: 1 },
+        execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }));
+      const lines = (await readFile(join(f.dir, "multi.txt"), "utf8")).split("\n"); lines[19] = "coordinator-last";
+      await writeFile(join(f.dir, "multi.txt"), lines.join("\n"));
+      const accepted = JSON.parse((await runCli(f.dir, f.env, ["--accept-candidate", "DIRTY-HUNK"])).stdout);
+      assert.equal(accepted.error.code, "CANDIDATE_APPLY_FAILED");
+      assert.match(accepted.error.message, /pre-existing checkout changes/);
+      assert.match(await readFile(join(f.dir, "multi.txt"), "utf8"), /coordinator-last/);
+    } finally { await f.cleanup(); }
+  });
+
+  test("refuses a candidate after the checkout HEAD advances", async () => {
+    const f = await fixture();
+    try {
+      const evidence = `\`\`\`subagent-evidence\n${JSON.stringify({ criteria: [{ criterion: "edit", status: "passed", evidence: [{ type: "command", reference: "true" }] }] })}\n\`\`\``;
+      await runCli(f.dir, { ...f.env, PI_MUTATION_MODE: "first-line", PI_MESSAGE: evidence }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "STALE-BASE", prompt: "edit", cwd: f.dir, scope: "read_write", allowed_paths: ["multi.txt"],
+        acceptance_criteria: ["edit"], verification: { commands: ["true"] }, iteration: { max_iterations: 1 },
+        execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }));
+      const lines = (await readFile(join(f.dir, "multi.txt"), "utf8")).split("\n"); lines[19] = "coordinator-committed";
+      await writeFile(join(f.dir, "multi.txt"), lines.join("\n"));
+      execFileSync("git", ["add", "multi.txt"], { cwd: f.dir });
+      execFileSync("git", ["commit", "-qm", "coordinator change"], { cwd: f.dir });
+      const accepted = JSON.parse((await runCli(f.dir, f.env, ["--accept-candidate", "STALE-BASE"])).stdout);
+      assert.equal(accepted.error.code, "CANDIDATE_APPLY_FAILED");
+      assert.match(accepted.error.message, /base HEAD no longer matches/);
+      assert.match(await readFile(join(f.dir, "multi.txt"), "utf8"), /coordinator-committed/);
     } finally { await f.cleanup(); }
   });
 

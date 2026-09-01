@@ -434,6 +434,12 @@ It first atomically renames the pending artifact to
 stable artifact, preventing double application. A failed check or apply moves
 the artifact back to pending. Conflicts return
 `CANDIDATE_APPLY_FAILED` without applying a partial patch.
+Acceptance also requires the current `HEAD` to equal the candidate's recorded
+base commit and every candidate-affected path in the main checkout to be clean.
+This prevents intervening commits or uncommitted user changes from being folded
+into the acceptance baseline. After apply, actual main-checkout fingerprints
+replace the candidate expectation. The durable candidate fingerprints remain a
+consistent recovery baseline if outcome persistence fails.
 The coordinator may instead run `--reject-candidate <task_id>`, which renames
 the artifact to `.rejected.patch` without touching the checkout. Non-empty
 candidates become ready only when every acceptance criterion has reproducible
@@ -446,6 +452,8 @@ Each completed Worker round atomically updates
 `.subagent-exec/outcomes/<task_id>.json`. It records task class, attempts,
 iterations, cumulative Worker tokens and cost, first/final verification,
 scope-violation count, elapsed time, terminal reason, and coordinator decision.
+Pi reports cumulative exact-session usage, so outcome totals use the greatest
+reported cumulative token/cost values rather than summing per-round snapshots.
 Acceptance fingerprints every applied candidate file and starts as `neutral`.
 Run `subagent-exec --assess-outcome <task_id>` after subsequent coordinator work:
 no reworked accepted files is `saved`, partial rework is `neutral`, and complete

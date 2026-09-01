@@ -85,8 +85,8 @@ import {
   type RpcState
 } from "./result.js";
 import { canContinueSession, diagnosticFingerprint, evaluateResultCircuit, failureClass } from "./circuit.js";
-import { acceptCandidate, createCandidateWorktree, discardCandidate, exportCandidatePatch, rejectCandidate } from "./candidate.js";
-import { assessOutcome, fingerprintFiles, recordCoordinatorDecision, recordIteration, recordPersistenceFailure, validateOutcomeTaskId } from "./outcome.js";
+import { acceptCandidate, candidateBaseHead, createCandidateWorktree, discardCandidate, exportCandidatePatch, rejectCandidate } from "./candidate.js";
+import { assessOutcome, fingerprintFiles, outcomeCandidateManifest, recordCoordinatorDecision, recordIteration, recordPersistenceFailure, validateOutcomeTaskId } from "./outcome.js";
 
 import type {
   ExecutionInfo,
@@ -436,7 +436,8 @@ async function prepareCandidateResult(session: SessionMetadata, result: WorkerRe
     try {
       const patchPath = await exportCandidatePatch(session.cwd, worktree, session.task_id);
       result.candidate = { status: "ready", patch_path: patchPath,
-        fingerprints: await fingerprintFiles(worktree, result.scope.changed_files) };
+        fingerprints: await fingerprintFiles(worktree, result.scope.changed_files),
+        base_head: await candidateBaseHead(worktree) };
       await discardCandidate(session.cwd, worktree);
       session.candidate_worktree = undefined;
     } catch (error) {
@@ -653,7 +654,8 @@ async function main(): Promise<void> {
       if (!/^[A-Za-z0-9._:-]{1,200}$/.test(acceptTaskId)) throw new Error("invalid candidate task id");
       release = await acquireSessionLease(process.cwd(), acceptTaskId);
       if (!release) throw new Error("candidate is busy");
-      const acceptedPath = await acceptCandidate(process.cwd(), acceptTaskId);
+      const candidate = await outcomeCandidateManifest(process.cwd(), acceptTaskId);
+      const acceptedPath = await acceptCandidate(process.cwd(), acceptTaskId, candidate.files, candidate.base_head);
       try {
         const outcome = await recordCoordinatorDecision(process.cwd(), acceptTaskId, "accepted");
         printResult({ schema_version: "1.0", task_id: acceptTaskId, status: "accepted", accepted_patch: acceptedPath, outcome });

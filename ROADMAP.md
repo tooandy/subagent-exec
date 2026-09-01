@@ -207,7 +207,8 @@ attempts must be disposable without modifying the user's working tree.
 - Terminal failures discard their worktree; repairable failures retain it for
   the one bounded continuation.
 - Applying a candidate requires an explicit coordinator command that first
-  performs `git apply --check` and cannot apply the same patch twice.
+  verifies the recorded base commit and clean affected paths, performs
+  `git apply --check`, and cannot apply the same patch twice.
 - Contract, guidance, and integration tests cover accept, reject, repair, and
   conflict behavior.
 
@@ -245,12 +246,9 @@ observed results to tune admission rules and budgets.
 - Contract, guidance, and tests cover successful acceptance, rejection, token
   aggregation, and subsequent coordinator rework.
 
-## Immediate implementation milestone
+## Current implementation status
 
-The next development milestone is limited to Phase 1:
-
-> Make continuation a reliable, exactly targeted, verification-preserving loop
-> with a default maximum of two rounds.
-
-Cost scoring, worktree isolation, and richer execution modes should wait until
-the session foundation and its tests are complete.
+Phases 1–6 are implemented and independently reviewed. The next milestone is
+operational calibration: collect outcome records across real task classes, then
+tune admission thresholds and cost/change budgets from observed saved, neutral,
+and amplified cohorts without weakening the fail-closed boundaries above.

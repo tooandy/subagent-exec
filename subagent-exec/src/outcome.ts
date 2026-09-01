@@ -11,6 +11,7 @@ export interface OutcomeRecord {
   first_pass_verification: "passed" | "failed" | "not_run"; final_verification: "passed" | "failed" | "not_run";
   scope_violations: number; coordinator_decision?: "accepted" | "rejected"; accepted_files: string[];
   accepted_fingerprints?: Record<string, string>; reworked_files: string[]; elapsed_ms_to_accepted?: number;
+  candidate_base_head?: string;
   terminal_failure_reason?: string; delegation_outcome?: "saved" | "neutral" | "amplified";
   rounds?: Array<{ iteration: number; tokens: number; cost: number; verification: "passed" | "failed" | "not_run"; scope_violations: number; terminal_reason?: string }>;
 }
@@ -53,13 +54,16 @@ export async function recordIteration(cwd: string, task: Task, result: WorkerRes
   if (existingRound >= 0) record.rounds[existingRound] = round; else record.rounds.push(round);
   record.rounds.sort((a, b) => a.iteration - b.iteration);
   record.attempts = record.rounds.length; record.iterations = Math.max(...record.rounds.map(item => item.iteration));
-  record.total_worker_tokens = record.rounds.reduce((sum, item) => sum + item.tokens, 0);
-  record.total_worker_cost = record.rounds.reduce((sum, item) => sum + item.cost, 0);
+  // Pi session stats are cumulative across exact-session continuations.
+  // Max is resilient to a missing/regressed stats response without double-counting.
+  record.total_worker_tokens = Math.max(...record.rounds.map(item => item.tokens));
+  record.total_worker_cost = Math.max(...record.rounds.map(item => item.cost));
   record.first_pass_verification = record.rounds[0].verification; record.final_verification = record.rounds.at(-1)!.verification;
   record.scope_violations = record.rounds.reduce((sum, item) => sum + item.scope_violations, 0);
   if (result.candidate?.status === "ready") {
     record.accepted_files = [...result.scope.changed_files];
     record.accepted_fingerprints = result.candidate.fingerprints;
+    record.candidate_base_head = result.candidate.base_head;
   }
   if (!result.continuation.allow_continuation && result.status !== "success") {
     record.terminal_failure_reason = result.error?.code ?? result.continuation.reason ?? result.status; record.delegation_outcome = "amplified";
@@ -67,13 +71,14 @@ export async function recordIteration(cwd: string, task: Task, result: WorkerRes
   await save(cwd, record);
 }
 
-export async function recordCoordinatorDecision(cwd: string, taskId: string, decision: "accepted" | "rejected", files: string[] = []): Promise<OutcomeRecord> {
+export async function recordCoordinatorDecision(cwd: string, taskId: string, decision: "accepted" | "rejected", files: string[] = [], preserveDurableBaseline = false): Promise<OutcomeRecord> {
   const record = await load(cwd, taskId); if (!record) throw new Error(`outcome record not found for ${taskId}`);
   record.updated_at = new Date().toISOString(); record.coordinator_decision = decision;
   if (decision === "rejected") { record.delegation_outcome = "amplified"; record.terminal_failure_reason ??= "COORDINATOR_REJECTED"; }
   else { record.accepted_at = record.updated_at; record.elapsed_ms_to_accepted = Date.parse(record.accepted_at) - Date.parse(record.started_at);
     record.accepted_files = files.length ? files : record.accepted_files;
     if (!record.accepted_fingerprints) throw new Error("durable candidate fingerprints are unavailable");
+    if (!preserveDurableBaseline) record.accepted_fingerprints = await fingerprintFiles(cwd, record.accepted_files);
     record.delegation_outcome = "neutral"; }
   await save(cwd, record); return record;
 }
@@ -93,9 +98,15 @@ export async function assessOutcome(cwd: string, taskId: string): Promise<Outcom
   if (rejected) return await recordCoordinatorDecision(cwd, taskId, "rejected");
   if (!accepted) throw new Error(pending ? `candidate decision pending for ${taskId}` : `candidate decision artifact missing for ${taskId}`);
   if (!record.accepted_fingerprints) throw new Error(`durable accepted fingerprints not found for ${taskId}`);
-  if (record.coordinator_decision !== "accepted") record = await recordCoordinatorDecision(cwd, taskId, "accepted");
+  if (record.coordinator_decision !== "accepted") record = await recordCoordinatorDecision(cwd, taskId, "accepted", [], true);
   record.reworked_files = (await Promise.all(record.accepted_files.map(async file => [file, await fingerprint(cwd, file)] as const)))
     .filter(([file, hash]) => record.accepted_fingerprints?.[file] !== hash).map(([file]) => file);
   record.delegation_outcome = record.reworked_files.length === 0 ? "saved" : record.reworked_files.length < record.accepted_files.length ? "neutral" : "amplified";
   record.updated_at = new Date().toISOString(); await save(cwd, record); return record;
+}
+
+export async function outcomeCandidateManifest(cwd: string, taskId: string): Promise<{ files: string[]; base_head: string }> {
+  const record = await load(cwd, taskId); if (!record?.accepted_files.length || !record.accepted_fingerprints) throw new Error(`durable candidate manifest not found for ${taskId}`);
+  if (!record.candidate_base_head) throw new Error(`durable candidate base HEAD not found for ${taskId}`);
+  return { files: [...record.accepted_files], base_head: record.candidate_base_head };
 }

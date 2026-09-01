@@ -19,6 +19,10 @@ export async function createCandidateWorktree(mainCwd: string): Promise<string> 
   return path;
 }
 
+export async function candidateBaseHead(worktree: string): Promise<string> {
+  return (await git(worktree, ["rev-parse", "HEAD"])).trim();
+}
+
 export async function exportCandidatePatch(mainCwd: string, worktree: string, taskId: string): Promise<string> {
   await git(worktree, ["add", "-N", "--", "."]);
   const names = (await git(worktree, ["diff", "--name-only", "-z", "HEAD", "--"]))
@@ -49,11 +53,17 @@ export async function discardCandidate(mainCwd: string, worktree: string): Promi
   await git(mainCwd, ["worktree", "remove", "--force", worktree]);
 }
 
-export async function acceptCandidate(mainCwd: string, taskId: string): Promise<string> {
+export async function acceptCandidate(mainCwd: string, taskId: string, candidateFiles: string[], baseHead: string): Promise<string> {
   if (!/^[A-Za-z0-9._:-]{1,200}$/.test(taskId)) throw new Error("invalid candidate task id");
   const dir = join(resolveRuntimeDir(mainCwd), "candidates");
   const patch = join(dir, `${taskId}.patch`);
   const accepted = join(dir, `${taskId}.accepted.patch`);
+  const currentHead = (await git(mainCwd, ["rev-parse", "HEAD"])).trim();
+  if (currentHead !== baseHead) throw new Error("candidate base HEAD no longer matches checkout HEAD");
+  if (candidateFiles.length) {
+    const dirty = await git(mainCwd, ["status", "--porcelain=v1", "-z", "--", ...candidateFiles]);
+    if (dirty.length) throw new Error("candidate paths contain pre-existing checkout changes");
+  }
   await rename(patch, accepted);
   try {
     await git(mainCwd, ["apply", "--check", accepted]);

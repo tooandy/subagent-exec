@@ -364,6 +364,7 @@ export interface WorkerResult {
     status: "pending" | "ready" | "discarded";
     patch_path?: string;
     fingerprints?: Record<string, string>;
+    base_head?: string;
   };
 
   usage?: UsageInfo;

@@ -58,6 +58,10 @@ its command, test, file, and symbol references as appropriate. A criterion
 marked `manual_review_required` is not accepted merely because the top-level
 status is `success`.
 
+Continue only when `continuation.allow_continuation` is true. A
+`coordinator_required` state means Codex must take over instead of retrying the
+same Worker session.
+
 Workers perform bounded tasks with explicit acceptance criteria.
 
 ## When to Use a Worker
@@ -90,7 +94,7 @@ Typical examples:
   verification and explicit change budgets.
 - Use `checkpoint` for medium-risk implementation. The first round is a
   read-only plan; review it before sending continuation feedback that authorizes
-  implementation.
+  implementation. Use `max_iterations: 3` only to reserve one bounded repair.
 - Use `investigation` for high-risk or ambiguous work. It is always read-only
   and single-round.
 

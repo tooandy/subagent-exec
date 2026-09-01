@@ -74,6 +74,8 @@ const TaskSchema = z.object({
     risk: z.enum(["low", "medium", "high"]),
     max_changed_files: z.number().int().positive().optional(),
     max_diff_lines: z.number().int().positive().optional(),
+    estimated_direct_cost_usd: z.number().positive().optional(),
+    max_cost_ratio: z.number().positive().max(1).optional(),
     on_failure: z.literal("return_to_coordinator")
   }).optional(),
 
@@ -167,7 +169,7 @@ export function buildWorkerPrompt(
 
   parts.push("");
   parts.push("### STRUCTURED ACCEPTANCE EVIDENCE");
-  parts.push("End your response with a fenced `subagent-evidence` JSON object containing: assumptions, decisions, criteria (criterion, status, evidence), changed_symbols, tests_added, known_risks, unresolved_items, review_locations, and recommended_next_action. Evidence entries use type command|test|file|symbol plus a concrete reference. Use manual_review_required when a criterion lacks reproducible evidence.");
+  parts.push("End your response with a fenced `subagent-evidence` JSON object containing: assumptions, decisions, criteria (criterion, status, evidence), changed_symbols, tests_added, known_risks, unresolved_items, review_locations, recommended_next_action, and optional handoff {type: architecture|requirement, reason}. Evidence entries use type command|test|file|symbol plus a concrete reference. Use manual_review_required when a criterion lacks reproducible evidence; use handoff when coordinator judgment is required instead of claiming success.");
 
   return parts.join("\n");
 }

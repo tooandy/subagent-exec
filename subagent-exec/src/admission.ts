@@ -39,7 +39,11 @@ export function evaluateAdmission(task: Task): AdmissionDecision {
     }
     if (policy.mode === "checkpoint") {
       if (policy.risk !== "medium") reasons.push("checkpoint mode requires risk=medium");
-      if ((task.iteration?.max_iterations ?? 2) !== 2) reasons.push("checkpoint mode requires max_iterations=2");
+      const iterations = task.iteration?.max_iterations ?? 2;
+      if (iterations !== 2 && iterations !== 3) reasons.push("checkpoint mode requires max_iterations=2 or 3");
+    }
+    if ((policy.estimated_direct_cost_usd === undefined) !== (policy.max_cost_ratio === undefined)) {
+      reasons.push("cost circuit requires estimated_direct_cost_usd and max_cost_ratio together");
     }
   }
 

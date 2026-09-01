@@ -55,6 +55,13 @@ export function classifyError(
 
   const lower = message.toLowerCase();
 
+  if (lower.includes("architecture decision") || lower.includes("architectural decision")) {
+    return createError("architecture", "ARCHITECTURE_DECISION_REQUIRED", message, { retryable: false });
+  }
+  if (lower.includes("ambiguous requirement") || lower.includes("requirements unclear")) {
+    return createError("requirement", "REQUIREMENT_CLARIFICATION_REQUIRED", message, { retryable: false });
+  }
+
   if (
     lower.includes("401") ||
     lower.includes("403") ||

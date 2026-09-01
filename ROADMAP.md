@@ -163,6 +163,22 @@ any state -> scope_violation | budget_exceeded | repeated_failure
           -> coordinator_required
 ```
 
+Checkpoint tasks may declare three iterations in this phase: plan,
+implementation, and one bounded repair. Two-iteration Checkpoints remain valid
+when no repair budget is desired.
+
+### Phase 4 exit criteria
+
+- Results expose a deterministic continuation state and failure class.
+- Scope, change/cost budget, architecture, requirement, and non-retryable
+  runtime failures require immediate coordinator takeover.
+- A Checkpoint permits at most one repair; repeated failure classes or
+  unchanged diagnostic evidence open the circuit.
+- Worker cost can be capped as a fraction of estimated direct-execution cost.
+- Successful and terminal sessions are archived; only repairable or
+  checkpoint-review sessions remain active.
+- Contract, guidance, and tests cover every stop rule and lifecycle transition.
+
 ## Phase 5: Isolated candidate changes
 
 Run write-capable workers in an isolated Git worktree or equivalent disposable

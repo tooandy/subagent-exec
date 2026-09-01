@@ -102,4 +102,14 @@ describe("delegation admission", () => {
       assert.ok(evaluateAdmission(task).reasons.some((reason) => reason.includes(expected)), expected);
     }
   });
+
+  test("requires both cost circuit inputs together", () => {
+    const decision = evaluateAdmission({
+      ...base, scope: "read_write", allowed_paths: ["src/**"], acceptance_criteria: ["done"],
+      verification: { commands: ["true"] }, iteration: { max_iterations: 1 },
+      execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10,
+        estimated_direct_cost_usd: 1, on_failure: "return_to_coordinator" }
+    });
+    assert.ok(decision.reasons.some((reason) => reason.includes("cost circuit")));
+  });
 });

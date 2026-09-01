@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
@@ -10,7 +10,8 @@ import {
   resolveMetadataDir,
   resolvePiSessionDir,
   saveSession,
-  withIteration
+  withIteration,
+  acquireSessionLease
 } from "../src/session.js";
 import { buildPiArgs } from "../src/process.js";
 import { buildContinuePrompt, parseContinueTask } from "../src/task.js";
@@ -21,6 +22,31 @@ async function tempWorkspace(): Promise<{ dir: string; cleanup: () => Promise<vo
 }
 
 describe("continuation contracts", () => {
+  test("fails closed on a stale lease", async () => {
+    const workspace = await tempWorkspace();
+    try {
+      const lockDir = join(workspace.dir, ".subagent-exec", "locks");
+      await mkdir(lockDir, { recursive: true });
+      await symlink("99999999", join(lockDir, "dead.json"));
+      const release = await acquireSessionLease(workspace.dir, "dead");
+      assert.equal(release, null);
+    } finally { await workspace.cleanup(); }
+  });
+
+  test("concurrent contenders cannot reclaim a stale lease", async () => {
+    const workspace = await tempWorkspace();
+    try {
+      const lockDir = join(workspace.dir, ".subagent-exec", "locks");
+      await mkdir(lockDir, { recursive: true });
+      await symlink("99999999", join(lockDir, "race.json"));
+      const [a, b] = await Promise.all([
+        acquireSessionLease(workspace.dir, "race"),
+        acquireSessionLease(workspace.dir, "race")
+      ]);
+      assert.equal([a, b].filter(Boolean).length, 0);
+      await a?.(); await b?.();
+    } finally { await workspace.cleanup(); }
+  });
   test("parses a valid continuation and rejects invalid timeout", () => {
     const value = parseContinueTask({
       schema_version: "1.0",

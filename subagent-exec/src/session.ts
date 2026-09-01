@@ -4,7 +4,8 @@ import {
   rename,
   mkdir,
   unlink,
-  access
+  access,
+  symlink
 } from "node:fs/promises";
 
 import {
@@ -27,6 +28,8 @@ export type { SessionMetadata };
 const SESSION_DIRNAME = ".subagent-exec";
 const METADATA_DIRNAME = "metadata";
 const PI_SESSION_DIRNAME = "pi-sessions";
+const ARCHIVE_DIRNAME = "archive";
+const LOCK_DIRNAME = "locks";
 
 const SessionMetadataSchema = z.object({
   schema_version: z.literal("1.0"),
@@ -38,6 +41,16 @@ const SessionMetadataSchema = z.object({
     status: z.enum(["success", "failed", "cancelled", "timeout", "needs_continuation"]),
     summary: z.string().optional(),
     changed_files: z.array(z.string())
+  }).optional(),
+  failure_history: z.array(z.object({
+    failure_class: z.string().min(1),
+    diagnostic_fingerprint: z.string().min(1)
+  })).default([]),
+  circuit: z.object({
+    allow_continuation: z.boolean(),
+    state: z.enum(["checkpoint_review", "repairable_failure", "coordinator_required", "terminal_success"]),
+    reason: z.enum(["scope_violation", "budget_exceeded", "repeated_failure", "no_new_diagnostics", "coordinator_required", "iteration_limit"]).optional(),
+    failure_class: z.string().optional()
   }).optional(),
   cwd: z.string().min(1),
   created_at: z.string().datetime(),
@@ -61,6 +74,8 @@ const SessionMetadataSchema = z.object({
       risk: z.enum(["low", "medium", "high"]),
       max_changed_files: z.number().int().positive().optional(),
       max_diff_lines: z.number().int().positive().optional(),
+      estimated_direct_cost_usd: z.number().positive().optional(),
+      max_cost_ratio: z.number().positive().max(1).optional(),
       on_failure: z.literal("return_to_coordinator")
     }).optional(),
     model: z.object({
@@ -127,6 +142,14 @@ export async function loadSession(
   }
 }
 
+export async function loadArchivedSession(cwd: string, taskId: string): Promise<SessionMetadata | null> {
+  const path = sessionPath(join(resolveRuntimeDir(cwd), ARCHIVE_DIRNAME), taskId);
+  try { await access(path); } catch { return null; }
+  const text = await readFile(path, "utf8");
+  try { return SessionMetadataSchema.parse(JSON.parse(text)) as SessionMetadata; }
+  catch (error) { throw new Error(`failed to parse archived session file ${path}: ${String(error)}`); }
+}
+
 export async function saveSession(
   metadata: SessionMetadata
 ): Promise<string> {
@@ -167,6 +190,32 @@ export async function deleteSession(
   }
 }
 
+export async function archiveSession(cwd: string, taskId: string): Promise<string> {
+  const source = sessionPath(resolveMetadataDir(cwd), taskId);
+  const archiveDir = join(resolveRuntimeDir(cwd), ARCHIVE_DIRNAME);
+  await mkdir(archiveDir, { recursive: true });
+  const destination = sessionPath(archiveDir, taskId);
+  await rename(source, destination);
+  return destination;
+}
+
+export async function acquireSessionLease(cwd: string, taskId: string): Promise<(() => Promise<void>) | null> {
+  const lockDir = join(resolveRuntimeDir(cwd), LOCK_DIRNAME);
+  await mkdir(lockDir, { recursive: true });
+  const path = sessionPath(lockDir, taskId);
+  try {
+    await symlink(String(process.pid), path);
+  } catch (error) {
+    // Fail closed for both live and stale locks. Automatic stale-owner
+    // takeover cannot be implemented as a portable filesystem CAS and risks
+    // two processes believing they own the task. Operators may remove a stale
+    // symlink only after independently confirming its process is gone.
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
+    throw error;
+  }
+  return async () => { try { await unlink(path); } catch { /* already released */ } };
+}
+
 /**
  * Create initial session metadata at task start.
  */
@@ -179,6 +228,7 @@ export function newSessionMetadata(task: Task): SessionMetadata {
     worker_session_id: randomUUID(),
     worker_session_dir: resolvePiSessionDir(task.cwd ?? process.cwd()),
     iteration: 0,
+    failure_history: [],
     cwd: task.cwd ?? process.cwd(),
     created_at: now,
     updated_at: now,
@@ -210,6 +260,8 @@ export function withIteration(
     worker_session_dir?: string;
     last_result?: SessionMetadata["last_result"];
     increment_iteration: boolean;
+    failure_history?: SessionMetadata["failure_history"];
+    circuit?: SessionMetadata["circuit"];
   }
 ): SessionMetadata {
   return {
@@ -223,6 +275,8 @@ export function withIteration(
       update.worker_session_dir ?? prev.worker_session_dir,
     last_result:
       update.last_result ?? prev.last_result,
+    failure_history: update.failure_history ?? prev.failure_history,
+    circuit: update.circuit ?? prev.circuit,
     updated_at: new Date().toISOString()
   };
 }

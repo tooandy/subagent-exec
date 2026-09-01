@@ -23,6 +23,9 @@ import {
 } from "./task.js";
 
 import {
+  archiveSession,
+  acquireSessionLease,
+  loadArchivedSession,
   loadSession,
   saveSession,
   deleteSession,
@@ -80,6 +83,7 @@ import {
   updateRpcState,
   type RpcState
 } from "./result.js";
+import { canContinueSession, diagnosticFingerprint, failureClass } from "./circuit.js";
 
 import type {
   ExecutionInfo,
@@ -364,6 +368,11 @@ function createFailedResult(
         ? "Return to the coordinator to decide whether to retry with revised instructions."
         : "Return to the coordinator for manual review and takeover."
     },
+    continuation: {
+      allow_continuation: false,
+      state: "coordinator_required" as const,
+      reason: "coordinator_required"
+    },
     error
   };
 }
@@ -372,6 +381,10 @@ async function persistIterationResult(
   session: SessionMetadata,
   result: WorkerResult
 ): Promise<void> {
+  const failure = result.error ? {
+    failure_class: failureClass(result.error),
+    diagnostic_fingerprint: diagnosticFingerprint(result)
+  } : undefined;
   await saveSession(withIteration(session, {
     worker_session_id: session.worker_session_id,
     worker_session_dir: session.worker_session_dir,
@@ -380,8 +393,15 @@ async function persistIterationResult(
       summary: result.result.summary,
       changed_files: result.result.changed_files
     },
+    failure_history: failure ? [...session.failure_history, failure] : session.failure_history,
+    circuit: result.continuation,
     increment_iteration: true
   }));
+}
+
+async function persistAndArchiveIfTerminal(session: SessionMetadata, result: WorkerResult): Promise<void> {
+  await persistIterationResult(session, result);
+  if (!result.continuation.allow_continuation) await archiveSession(session.cwd, session.task_id);
 }
 
 function applySessionPersistenceFailure(
@@ -395,6 +415,12 @@ function applySessionPersistenceFailure(
     `Failed to persist continuation state: ${String(error)}`,
     { retryable: false }
   );
+  result.continuation = {
+    allow_continuation: false,
+    state: "coordinator_required",
+    reason: "coordinator_required",
+    failure_class: "runtime:SESSION_PERSISTENCE_FAILED"
+  };
   result.acceptance_evidence.recommended_next_action ??=
     "Return to the coordinator for manual review and takeover.";
 }
@@ -591,11 +617,21 @@ async function main(): Promise<void> {
      * invoking the CLI — typically process.cwd() but the session
      * can also be located by walking up parents if needed.
      */
-    const metadata = await loadSession(
+    let metadata = await loadSession(
       process.cwd(),
       continueTask.task_id
     );
     if (!metadata) {
+      const archived = await loadArchivedSession(process.cwd(), continueTask.task_id);
+      if (archived) {
+        printResult(createFailedResult(continueTask.task_id, createError(
+          "runtime", "CIRCUIT_BREAKER_OPEN",
+          `Task "${continueTask.task_id}" is archived and requires coordinator takeover.`,
+          { retryable: false, details: archived.circuit }
+        ), new Date(), null, archived.original_task.acceptance_criteria));
+        process.exitCode = 1;
+        return;
+      }
       printResult(
         createFailedResult(
           continueTask.task_id,
@@ -613,12 +649,56 @@ async function main(): Promise<void> {
       return;
     }
 
+    const preLeaseDelay = Number(process.env.SUBAGENT_EXEC_TEST_PRE_LEASE_DELAY_MS ?? 0);
+    if (preLeaseDelay > 0) await sleep(preLeaseDelay);
+    let releaseLease: (() => Promise<void>) | null;
+    try {
+      releaseLease = await acquireSessionLease(metadata.cwd, metadata.task_id);
+    } catch (error) {
+      printResult(createFailedResult(continueTask.task_id, createError(
+        "runtime", "SESSION_LEASE_ERROR", `Cannot acquire task lease: ${String(error)}`,
+        { retryable: false }
+      ), new Date(), null, metadata.original_task.acceptance_criteria));
+      process.exitCode = 1;
+      return;
+    }
+    if (!releaseLease) {
+      printResult(createFailedResult(continueTask.task_id, createError(
+        "runtime", "SESSION_BUSY", `Task "${continueTask.task_id}" already has a continuation in progress.`,
+        { retryable: true }
+      ), new Date(), null, metadata.original_task.acceptance_criteria));
+      process.exitCode = 1;
+      return;
+    }
+
+    // The pre-lock lookup is only enough to locate the lease. All decisions
+    // must use a fresh snapshot read while holding it.
+    metadata = await loadSession(process.cwd(), continueTask.task_id);
+    if (!metadata) {
+      const archived = await loadArchivedSession(process.cwd(), continueTask.task_id);
+      printResult(createFailedResult(continueTask.task_id, createError(
+        "runtime", archived ? "CIRCUIT_BREAKER_OPEN" : "SESSION_NOT_FOUND",
+        archived ? `Task "${continueTask.task_id}" became terminal before this continuation acquired its lease.` : `Task "${continueTask.task_id}" no longer has active metadata.`,
+        { retryable: false, details: archived?.circuit }
+      ), new Date(), null, archived?.original_task.acceptance_criteria));
+      process.exitCode = archived ? 1 : 2;
+      await releaseLease();
+      return;
+    }
+
     /*
      * Enforce max_iterations from the original task.
      */
     const limit = metadata.original_task.iteration?.max_iterations ?? 2;
 
     if (metadata.iteration >= limit) {
+      const terminalCircuit = {
+        allow_continuation: false,
+        state: "coordinator_required" as const,
+        reason: "iteration_limit" as const
+      };
+      await saveSession({ ...metadata, circuit: terminalCircuit, updated_at: new Date().toISOString() });
+      await archiveSession(metadata.cwd, metadata.task_id);
       printResult(
         createFailedResult(
           continueTask.task_id,
@@ -641,17 +721,31 @@ async function main(): Promise<void> {
         )
       );
       process.exitCode = 1;
+      await releaseLease();
       return;
     }
 
     if (metadata.original_task.execution_policy?.mode === "checkpoint" &&
-        metadata.last_result?.status !== "needs_continuation") {
+        metadata.iteration === 1 && metadata.last_result?.status !== "needs_continuation") {
       printResult(createFailedResult(continueTask.task_id, createError(
         "protocol", "CHECKPOINT_PLAN_NOT_APPROVED",
         `Task "${continueTask.task_id}" cannot continue because its planning round did not complete successfully.`,
         { retryable: false }
       ), new Date(), null, metadata.original_task.acceptance_criteria));
       process.exitCode = 1;
+      await releaseLease();
+      return;
+    }
+
+    const circuit = canContinueSession(metadata);
+    if (metadata.iteration > 1 && !circuit.allow_continuation) {
+      printResult(createFailedResult(continueTask.task_id, createError(
+        "runtime", "CIRCUIT_BREAKER_OPEN",
+        `Task "${continueTask.task_id}" requires coordinator takeover (${circuit.reason ?? circuit.state}).`,
+        { retryable: false, details: circuit }
+      ), new Date(), null, metadata.original_task.acceptance_criteria));
+      process.exitCode = 1;
+      await releaseLease();
       return;
     }
 
@@ -689,7 +783,11 @@ async function main(): Promise<void> {
       }
     };
 
-    await runIteration(synthetic, metadata);
+    try {
+      await runIteration(synthetic, metadata);
+    } finally {
+      await releaseLease();
+    }
     return;
   }
 
@@ -714,8 +812,38 @@ async function main(): Promise<void> {
   if (rawTask === undefined) {
     return; // --help handled
   }
-
-  await runIteration(rawTask, undefined);
+  let initialTask: Task;
+  try {
+    initialTask = parseTask(rawTask);
+  } catch {
+    await runIteration(rawTask, undefined);
+    return;
+  }
+  const initialCwd = resolve(initialTask.cwd ?? process.cwd());
+  let releaseLease: (() => Promise<void>) | null;
+  try {
+    releaseLease = await acquireSessionLease(initialCwd, initialTask.task_id);
+  } catch (error) {
+    printResult(createFailedResult(initialTask.task_id, createError(
+      "runtime", "SESSION_LEASE_ERROR", `Cannot acquire task lease: ${String(error)}`,
+      { retryable: false }
+    ), new Date(), null, initialTask.acceptance_criteria));
+    process.exitCode = 1;
+    return;
+  }
+  if (!releaseLease) {
+    printResult(createFailedResult(initialTask.task_id, createError(
+      "runtime", "SESSION_BUSY", `Task "${initialTask.task_id}" already has an execution in progress.`,
+      { retryable: true }
+    ), new Date(), null, initialTask.acceptance_criteria));
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    await runIteration(initialTask, undefined);
+  } finally {
+    await releaseLease();
+  }
 }
 
 async function runIteration(
@@ -1083,10 +1211,11 @@ async function runIteration(
         },
         createDefaultVerification(),
         workerError,
-        iterationNumber
+        iterationNumber,
+        session.failure_history
       );
     try {
-      await persistIterationResult(session, result);
+      await persistAndArchiveIfTerminal(session, result);
     } catch (sessionError) {
       applySessionPersistenceFailure(result, sessionError);
     }
@@ -1181,10 +1310,11 @@ async function runIteration(
         },
         createDefaultVerification(),
         workerError,
-        iterationNumber
+        iterationNumber,
+        session.failure_history
       );
     try {
-      await persistIterationResult(session, result);
+      await persistAndArchiveIfTerminal(session, result);
     } catch (sessionError) {
       applySessionPersistenceFailure(result, sessionError);
     }
@@ -1467,6 +1597,18 @@ async function runIteration(
     status: verification.status
   });
 
+  const costLimit = task.execution_policy?.estimated_direct_cost_usd !== undefined &&
+    task.execution_policy.max_cost_ratio !== undefined
+      ? task.execution_policy.estimated_direct_cost_usd * task.execution_policy.max_cost_ratio
+      : undefined;
+  if (costLimit !== undefined && state.usage?.cost !== undefined && state.usage.cost >= costLimit) {
+    workerError = createError(
+      "scope", "WORKER_COST_BUDGET_EXCEEDED",
+      "Worker cost reached the configured fraction of estimated direct execution cost",
+      { retryable: false, details: { worker_cost_usd: state.usage?.cost ?? 0, cost_limit_usd: costLimit } }
+    );
+  }
+
   /*
    * 14. Build and print result.
    */
@@ -1493,18 +1635,27 @@ async function runIteration(
     scope,
     verification,
     workerError,
-    iterationNumber
+    iterationNumber,
+    session.failure_history
   );
 
   if (checkpointPlanning && !result.error) {
     result.status = "needs_continuation";
+    result.continuation = { allow_continuation: true, state: "checkpoint_review" };
     result.needs_continuation = {
       reason: "Checkpoint plan is ready for coordinator review"
+    };
+  } else if (checkpointPlanning && result.error && result.continuation.allow_continuation) {
+    result.continuation = {
+      allow_continuation: false,
+      state: "coordinator_required",
+      reason: result.error.category === "scope" ? "scope_violation" : "coordinator_required",
+      failure_class: failureClass(result.error)
     };
   }
 
   try {
-    await persistIterationResult(session, result);
+    await persistAndArchiveIfTerminal(session, result);
   } catch (sessionError) {
     logger.log("session_save_failed", {
       error: String(sessionError)
@@ -1528,7 +1679,7 @@ async function runIteration(
           ? 130
           : 1;
 
-  process.exit(process.exitCode);
+  return;
 }
 
 main().catch((error) => {

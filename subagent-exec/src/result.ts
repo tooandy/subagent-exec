@@ -13,6 +13,8 @@ import type {
   Task
 } from "./types.js";
 import { extractAcceptanceEvidence } from "./evidence.js";
+import { evaluateResultCircuit } from "./circuit.js";
+import type { SessionMetadata } from "./types.js";
 
 export interface RpcState {
   settled: boolean;
@@ -190,8 +192,23 @@ export function buildResult(
   scope: ScopeInfo,
   verification: VerificationResult,
   error: WorkerError | null,
-  iteration: number
+  iteration: number,
+  previousFailures: SessionMetadata["failure_history"] = []
 ): WorkerResult {
+  const acceptanceEvidence = extractAcceptanceEvidence(state.assistantMessage, task.acceptance_criteria, {
+    verification,
+    changedFiles: scope.changed_files
+  });
+  if (!error && acceptanceEvidence.handoff) {
+    error = {
+      category: acceptanceEvidence.handoff.type,
+      code: acceptanceEvidence.handoff.type === "architecture"
+        ? "ARCHITECTURE_DECISION_REQUIRED"
+        : "REQUIREMENT_CLARIFICATION_REQUIRED",
+      message: acceptanceEvidence.handoff.reason,
+      retryable: false
+    };
+  }
   let status:
     | "success"
     | "failed"
@@ -209,17 +226,13 @@ export function buildResult(
     status = "success";
   }
 
-  const acceptanceEvidence = extractAcceptanceEvidence(state.assistantMessage, task.acceptance_criteria, {
-    verification,
-    changedFiles: scope.changed_files
-  });
   if (error && !acceptanceEvidence.recommended_next_action) {
     acceptanceEvidence.recommended_next_action = error.retryable
       ? "Return to the coordinator to decide whether to retry with revised instructions."
       : "Return to the coordinator for manual review and takeover.";
   }
 
-  return {
+  const result: WorkerResult = {
     schema_version: "1.0",
 
     task_id: task.task_id,
@@ -249,6 +262,8 @@ export function buildResult(
 
     acceptance_evidence: acceptanceEvidence,
 
+    continuation: { allow_continuation: false, state: "terminal_success" },
+
     usage: state.usage,
 
     iteration,
@@ -257,4 +272,16 @@ export function buildResult(
 
     metadata: task.metadata
   };
+  result.continuation = evaluateResultCircuit(result, previousFailures);
+  const maxIterations = task.iteration?.max_iterations ??
+    (task.execution_policy?.mode === "checkpoint" ? 2 : 1);
+  if (result.error && result.continuation.allow_continuation && iteration >= maxIterations) {
+    result.continuation = {
+      allow_continuation: false,
+      state: "coordinator_required",
+      reason: "iteration_limit",
+      failure_class: result.continuation.failure_class
+    };
+  }
+  return result;
 }

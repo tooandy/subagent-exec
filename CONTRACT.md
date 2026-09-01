@@ -79,6 +79,8 @@ overwrite constraints by editing the prompt.
 | `risk` | enum | `low`, `medium`, or `high`; constrained by mode. |
 | `max_changed_files` | integer | Required positive file budget for implementation modes. |
 | `max_diff_lines` | integer | Required positive changed-line budget for implementation modes. |
+| `estimated_direct_cost_usd` | number | Optional direct-execution cost estimate; paired with `max_cost_ratio`. |
+| `max_cost_ratio` | number | Optional worker/direct cost ceiling in `(0,1]`; paired with the estimate. |
 | `on_failure` | enum | V1 requires `return_to_coordinator`. |
 
 Admission rules:
@@ -86,9 +88,8 @@ Admission rules:
 - Fast requires `scope=read_write`, low risk, one iteration, allowed paths,
   acceptance criteria, verification commands, and both change budgets.
 - Checkpoint requires the same implementation boundaries, medium risk, and two
-  iterations. Round one is forced read-only and returns
-  `needs_continuation`; round two performs implementation after coordinator
-  approval.
+  or three iterations. Round one is forced read-only, round two implements,
+  and an optional third round is the only repair attempt.
 - Investigation requires `scope=read_only`, high risk, and one iteration.
 - Missing or inconsistent boundaries return `DELEGATION_NOT_RECOMMENDED`
   before Pi is spawned.
@@ -196,6 +197,7 @@ Runtime state is stored under `<cwd>/.subagent-exec/`: contract metadata in
 | `scope` | object | Workspace scope verification. |
 | `verification` | object | Verification command results. |
 | `acceptance_evidence` | object | Structured criterion evidence and review guidance. |
+| `continuation` | object | Circuit state, permission, failure class, and stop reason. |
 | `usage` | object or null | Token / cost usage (may be null if unavailable). |
 | `iteration` | integer | Current one-based session round. |
 | `needs_continuation` | object | Present when a Checkpoint plan awaits coordinator review. |
@@ -217,7 +219,9 @@ must equal a complete line in successful verification output; a `file` must iden
 file (optionally with a positive integer `:line`); and a `symbol` must use `path#symbol` for a
 changed file. These checks establish reproducibility, not semantic sufficiency.
 
-Missing or malformed evidence, omitted criteria, and `passed` claims without
+The optional structured `handoff` (`architecture` or `requirement` plus a
+reason) converts an otherwise successful response into a coordinator-required
+failure. Missing or malformed evidence, omitted criteria, and `passed` claims without
 evidence are normalized to `manual_review_required`. The overall task may still
 return `success`; the coordinator must inspect this field before acceptance.
 
@@ -347,6 +351,8 @@ May be null if the worker runtime does not support session stats.
 | `protocol` | Invalid RPC, missing events, schema mismatch | varies |
 | `scope` | Worker modified files outside `allowed_paths` (read_write) or any file (read_only) | no |
 | `verification` | Verification command failed | no |
+| `architecture` | Worker explicitly requests an architecture decision | no |
+| `requirement` | Worker explicitly requests requirement clarification | no |
 
 #### Common error codes
 
@@ -369,6 +375,39 @@ May be null if the worker runtime does not support session stats.
 | `DELEGATION_NOT_RECOMMENDED` | protocol | Admission policy rejected the task before Worker spawn |
 | `CHECKPOINT_PLAN_NOT_APPROVED` | protocol | Checkpoint continuation requested after an unsuccessful planning round |
 | `CHANGE_BUDGET_EXCEEDED` | scope | Worker exceeded the declared file-count or diff-line budget |
+| `WORKER_COST_BUDGET_EXCEEDED` | scope | Worker cost reached the configured direct-cost fraction |
+| `CIRCUIT_BREAKER_OPEN` | runtime | Archived or terminal session cannot continue |
+| `SESSION_BUSY` | runtime | Another process holds the task continuation lease |
+| `SESSION_LEASE_ERROR` | runtime | Lease infrastructure failed; execution did not start |
+| `ARCHITECTURE_DECISION_REQUIRED` | architecture | Coordinator must make an architecture decision |
+| `REQUIREMENT_CLARIFICATION_REQUIRED` | requirement | Coordinator must clarify ambiguous requirements |
+
+### continuation and session lifecycle
+
+`continuation.state` is `checkpoint_review`, `repairable_failure`,
+`coordinator_required`, or `terminal_success`. `allow_continuation` is true
+only for the first two. Stop reasons are `scope_violation`, `budget_exceeded`,
+`repeated_failure`, `no_new_diagnostics`, `coordinator_required`, or
+`iteration_limit`; `failure_class` is either a stable category/code key or a
+terminal class (`scope_violation`, `budget_exceeded`, `coordinator_required`).
+
+Each failure persists a diagnostic fingerprint derived from its error class,
+verification output, unresolved items, and risks. A second identical class
+stops as repeated; an identical fingerprint stops as no new diagnostics.
+Continuation uses an exclusive task lease, so concurrent attempts return
+`SESSION_BUSY`. Success and terminal failure metadata moves from `metadata/`
+to `archive/`; archived sessions reject continuation.
+
+Leases fail closed: a stale owner symlink is never reclaimed automatically,
+because portable filesystems do not provide a safe compare-and-swap takeover.
+An operator may remove it only after independently confirming the recorded PID
+is gone. Metadata is reloaded after acquiring the lease, preventing stale reads
+from executing an already completed iteration.
+
+Cost limits apply whenever Pi reports usage stats, including when another
+failure occurred in the same round, and take terminal precedence. If a process
+ends before stats are available, the runtime cannot infer unreported cost and
+the other stop rule governs that round.
 
 ---
 

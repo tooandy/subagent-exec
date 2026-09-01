@@ -18,7 +18,11 @@ const EvidenceSchema = z.object({
   known_risks: z.array(z.string()).default([]),
   unresolved_items: z.array(z.string()).default([]),
   review_locations: z.array(z.string()).default([]),
-  recommended_next_action: z.string().min(1).optional()
+  recommended_next_action: z.string().min(1).optional(),
+  handoff: z.object({
+    type: z.enum(["architecture", "requirement"]),
+    reason: z.string().trim().min(1)
+  }).optional()
 });
 
 function empty(criteria: string[]): AcceptanceEvidence {

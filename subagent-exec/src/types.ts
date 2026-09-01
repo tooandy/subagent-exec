@@ -5,7 +5,9 @@ export type ErrorCategory =
   | "runtime"
   | "protocol"
   | "scope"
-  | "verification";
+  | "verification"
+  | "architecture"
+  | "requirement";
 
 export type TaskStatus =
   | "success"
@@ -47,6 +49,8 @@ export interface ExecutionPolicy {
   risk: RiskLevel;
   max_changed_files?: number;
   max_diff_lines?: number;
+  estimated_direct_cost_usd?: number;
+  max_cost_ratio?: number;
   on_failure: "return_to_coordinator";
 }
 
@@ -159,6 +163,14 @@ export interface SessionMetadata {
     status: TaskStatus;
     summary?: string;
     changed_files: string[];
+  };
+
+  failure_history: Array<{ failure_class: string; diagnostic_fingerprint: string }>;
+  circuit?: {
+    allow_continuation: boolean;
+    state: "checkpoint_review" | "repairable_failure" | "coordinator_required" | "terminal_success";
+    reason?: "scope_violation" | "budget_exceeded" | "repeated_failure" | "no_new_diagnostics" | "coordinator_required" | "iteration_limit";
+    failure_class?: string;
   };
 
   /**
@@ -308,6 +320,7 @@ export interface AcceptanceEvidence {
   unresolved_items: string[];
   review_locations: string[];
   recommended_next_action?: string;
+  handoff?: { type: "architecture" | "requirement"; reason: string };
 }
 
 export interface WorkerResult {
@@ -334,6 +347,13 @@ export interface WorkerResult {
   verification: VerificationResult;
 
   acceptance_evidence: AcceptanceEvidence;
+
+  continuation: {
+    allow_continuation: boolean;
+    state: "checkpoint_review" | "repairable_failure" | "coordinator_required" | "terminal_success";
+    reason?: "scope_violation" | "budget_exceeded" | "repeated_failure" | "no_new_diagnostics" | "coordinator_required" | "iteration_limit";
+    failure_class?: string;
+  };
 
   usage?: UsageInfo;
 

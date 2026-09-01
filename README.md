@@ -101,6 +101,13 @@ requirements are rejected before a Worker is started. Prompts are capped at
 coordinator remains responsible for making each prompt semantically
 self-contained.
 
+Checkpoint tasks can reserve a third round for one repair. Result
+`continuation` state stops immediately on scope, budget, architecture,
+requirement, or non-retryable runtime failures, and after repeated failure or
+unchanged diagnostics. Optional direct-cost estimates and ratios provide a
+worker-cost circuit. Successful and terminal metadata is archived under
+`.subagent-exec/archive`; only actionable sessions stay active.
+
 ## Run
 
 ```bash

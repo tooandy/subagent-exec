@@ -120,6 +120,19 @@ describe("continuation CLI integration", () => {
     } finally { await f.cleanup(); }
   });
 
+  test("fails closed before spawning when lease infrastructure is unavailable", async () => {
+    const f = await fixture();
+    try {
+      const blocked = join(f.dir, "runtime-file");
+      await writeFile(blocked, "not a directory", "utf8");
+      const result = await runCli(f.dir, { ...f.env, SUBAGENT_EXEC_SESSION_DIR: blocked }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "LOCK-FAIL", prompt: "x", cwd: f.dir
+      }));
+      assert.equal(JSON.parse(result.stdout).error.code, "SESSION_LEASE_ERROR");
+      await assert.rejects(() => readFile(f.argsLog, "utf8"));
+    } finally { await f.cleanup(); }
+  });
+
   test("starts then resumes the exact same session and reruns verification", async () => {
     const f = await fixture();
     try {
@@ -165,7 +178,7 @@ describe("continuation CLI integration", () => {
       const exhausted = await runCli(f.dir, f.env, ["--continue", "ONE"], JSON.stringify({
         schema_version: "1.0", task_id: "ONE", action: "continue", feedback: "x"
       }));
-      assert.equal(JSON.parse(exhausted.stdout).error.code, "MAX_ITERATIONS_EXCEEDED");
+      assert.equal(JSON.parse(exhausted.stdout).error.code, "CIRCUIT_BREAKER_OPEN");
     } finally { await f.cleanup(); }
   });
 
@@ -231,7 +244,7 @@ describe("continuation CLI integration", () => {
       assert.equal(JSON.parse(timed.stdout).status, "timeout");
       assert.equal(JSON.parse(timed.stdout).acceptance_evidence.criteria[0].status, "manual_review_required");
       assert.ok(JSON.parse(timed.stdout).acceptance_evidence.recommended_next_action);
-      const timedMetadata = JSON.parse(await readFile(join(hanging.dir, ".subagent-exec", "metadata", "TIME.json"), "utf8"));
+      const timedMetadata = JSON.parse(await readFile(join(hanging.dir, ".subagent-exec", "archive", "TIME.json"), "utf8"));
       assert.equal(timedMetadata.iteration, 1);
       assert.equal(timedMetadata.last_result.status, "timeout");
 
@@ -240,7 +253,7 @@ describe("continuation CLI integration", () => {
       child.stdin.end(JSON.stringify({
         schema_version: "1.0", task_id: "CANCEL", prompt: "x", cwd: hanging.dir, timeout_ms: 5000,
         scope: "read_write", allowed_paths: ["*.txt"], acceptance_criteria: ["done"],
-        verification: { commands: ["true"] }, iteration: { max_iterations: 1 },
+        verification: { commands: ["false"] }, iteration: { max_iterations: 1 },
         execution_policy: { mode: "fast", risk: "low", max_changed_files: 10, max_diff_lines: 100, on_failure: "return_to_coordinator" }
       }));
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 700));
@@ -249,7 +262,7 @@ describe("continuation CLI integration", () => {
       assert.equal(code, 130);
       assert.equal(JSON.parse(stdout).status, "cancelled");
       assert.ok(JSON.parse(stdout).acceptance_evidence.recommended_next_action);
-      const cancelledMetadata = JSON.parse(await readFile(join(hanging.dir, ".subagent-exec", "metadata", "CANCEL.json"), "utf8"));
+      const cancelledMetadata = JSON.parse(await readFile(join(hanging.dir, ".subagent-exec", "archive", "CANCEL.json"), "utf8"));
       assert.equal(cancelledMetadata.iteration, 1);
       assert.equal(cancelledMetadata.last_result.status, "cancelled");
     } finally { await hanging.cleanup(); }
@@ -287,8 +300,9 @@ describe("continuation CLI integration", () => {
   test("turns session persistence failure into a structured failure", async () => {
     const f = await fixture();
     try {
-      const blockedPath = join(f.dir, "not-a-directory");
-      await writeFile(blockedPath, "file", "utf8");
+      const blockedPath = join(f.dir, "blocked-runtime");
+      await mkdir(blockedPath);
+      await writeFile(join(blockedPath, "metadata"), "file", "utf8");
       const result = await runCli(f.dir, { ...f.env, SUBAGENT_EXEC_SESSION_DIR: blockedPath }, [], JSON.stringify({
         schema_version: "1.0", task_id: "PERSIST-FAIL", prompt: "x", cwd: f.dir
       }));
@@ -297,6 +311,9 @@ describe("continuation CLI integration", () => {
       assert.equal(parsed.status, "failed");
       assert.equal(parsed.error.code, "SESSION_PERSISTENCE_FAILED");
       assert.ok(parsed.acceptance_evidence.recommended_next_action);
+      assert.equal(parsed.continuation.allow_continuation, false);
+      assert.equal(parsed.continuation.state, "coordinator_required");
+      assert.equal(parsed.continuation.failure_class, "runtime:SESSION_PERSISTENCE_FAILED");
     } finally { await f.cleanup(); }
   });
 
@@ -365,7 +382,7 @@ describe("continuation CLI integration", () => {
         schema_version: "1.0", task_id: "FAILED-PLAN", action: "continue", feedback: "continue anyway"
       }));
       assert.equal(continued.code, 1);
-      assert.equal(JSON.parse(continued.stdout).error.code, "CHECKPOINT_PLAN_NOT_APPROVED");
+      assert.equal(JSON.parse(continued.stdout).error.code, "CIRCUIT_BREAKER_OPEN");
     } finally { await f.cleanup(); }
   });
 
@@ -428,6 +445,122 @@ describe("continuation CLI integration", () => {
       const evidence = JSON.parse(completed.stdout).acceptance_evidence;
       assert.equal(evidence.criteria[0].status, "passed");
       assert.equal(evidence.review_locations[0], "tracked.txt:1");
+    } finally { await f.cleanup(); }
+  });
+
+  test("opens the cost circuit at the configured direct-execution fraction", async () => {
+    const f = await fixture();
+    try {
+      const completed = await runCli(f.dir, f.env, [], JSON.stringify({
+        schema_version: "1.0", task_id: "COST", prompt: "small edit", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["done"],
+        verification: { commands: ["false"] }, iteration: { max_iterations: 1 },
+        execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10,
+          estimated_direct_cost_usd: 0.01, max_cost_ratio: 0.5, on_failure: "return_to_coordinator" }
+      }));
+      const result = JSON.parse(completed.stdout);
+      assert.equal(result.error.code, "WORKER_COST_BUDGET_EXCEEDED");
+      assert.equal(result.continuation.reason, "budget_exceeded");
+    } finally { await f.cleanup(); }
+  });
+
+  test("preserves budget_exceeded when cost opens during checkpoint planning", async () => {
+    const f = await fixture();
+    try {
+      const result = JSON.parse((await runCli(f.dir, f.env, [], JSON.stringify({
+        schema_version: "1.0", task_id: "PLAN-COST", prompt: "plan", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["plan"],
+        verification: { commands: ["true"] }, iteration: { max_iterations: 2 },
+        execution_policy: { mode: "checkpoint", risk: "medium", max_changed_files: 1, max_diff_lines: 10,
+          estimated_direct_cost_usd: 0.01, max_cost_ratio: 0.5, on_failure: "return_to_coordinator" }
+      }))).stdout);
+      assert.equal(result.error.code, "WORKER_COST_BUDGET_EXCEEDED");
+      assert.equal(result.continuation.reason, "budget_exceeded");
+      assert.equal(result.continuation.failure_class, "budget_exceeded");
+    } finally { await f.cleanup(); }
+  });
+
+  test("allows one checkpoint repair then opens on unchanged repeated failure", async () => {
+    const f = await fixture();
+    try {
+      const task = {
+        schema_version: "1.0", task_id: "REPAIR", prompt: "plan then implement", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["verification passes"],
+        verification: { commands: ["false"] }, iteration: { max_iterations: 3 },
+        execution_policy: { mode: "checkpoint", risk: "medium", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      };
+      assert.equal(JSON.parse((await runCli(f.dir, f.env, [], JSON.stringify(task))).stdout).status, "needs_continuation");
+      const implementation = await runCli(f.dir, f.env, ["--continue", "REPAIR"], JSON.stringify({ schema_version: "1.0", task_id: "REPAIR", action: "continue", feedback: "implement" }));
+      assert.equal(JSON.parse(implementation.stdout).continuation.allow_continuation, true);
+      const repair = await runCli(f.dir, f.env, ["--continue", "REPAIR"], JSON.stringify({ schema_version: "1.0", task_id: "REPAIR", action: "continue", feedback: "repair" }));
+      const result = JSON.parse(repair.stdout);
+      assert.equal(result.continuation.allow_continuation, false);
+      assert.equal(result.continuation.reason, "no_new_diagnostics");
+      const blocked = await runCli(f.dir, f.env, ["--continue", "REPAIR"], JSON.stringify({ schema_version: "1.0", task_id: "REPAIR", action: "continue", feedback: "again" }));
+      assert.equal(JSON.parse(blocked.stdout).error.code, "CIRCUIT_BREAKER_OPEN");
+    } finally { await f.cleanup(); }
+  });
+
+  test("archives an exhausted two-round checkpoint without offering repair", async () => {
+    const f = await fixture();
+    try {
+      const task = {
+        schema_version: "1.0", task_id: "NO-REPAIR", prompt: "plan", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["pass"],
+        verification: { commands: ["false"] }, iteration: { max_iterations: 2 },
+        execution_policy: { mode: "checkpoint", risk: "medium", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      };
+      await runCli(f.dir, f.env, [], JSON.stringify(task));
+      const failed = JSON.parse((await runCli(f.dir, f.env, ["--continue", "NO-REPAIR"], JSON.stringify({ schema_version: "1.0", task_id: "NO-REPAIR", action: "continue", feedback: "implement" }))).stdout);
+      assert.equal(failed.continuation.reason, "iteration_limit");
+      await assert.rejects(() => readFile(join(f.dir, ".subagent-exec", "metadata", "NO-REPAIR.json"), "utf8"));
+      assert.ok(await readFile(join(f.dir, ".subagent-exec", "archive", "NO-REPAIR.json"), "utf8"));
+    } finally { await f.cleanup(); }
+  });
+
+  test("rejects concurrent continuations with a task lease", async () => {
+    const f = await fixture();
+    try {
+      const task = { schema_version: "1.0", task_id: "LEASE", prompt: "plan", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["done"], verification: { commands: ["true"] },
+        iteration: { max_iterations: 2 }, execution_policy: { mode: "checkpoint", risk: "medium", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" } };
+      await runCli(f.dir, f.env, [], JSON.stringify(task));
+      const first = runCli(f.dir, { ...f.env, PI_MODE: "hang" }, ["--continue", "LEASE"], JSON.stringify({ schema_version: "1.0", task_id: "LEASE", action: "continue", feedback: "one", timeout_ms: 1000 }));
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
+      const second = await runCli(f.dir, f.env, ["--continue", "LEASE"], JSON.stringify({ schema_version: "1.0", task_id: "LEASE", action: "continue", feedback: "two" }));
+      assert.equal(JSON.parse(second.stdout).error.code, "SESSION_BUSY");
+      await first;
+    } finally { await f.cleanup(); }
+  });
+
+  test("reloads metadata under the lease instead of executing a stale iteration", async () => {
+    const f = await fixture();
+    try {
+      const task = { schema_version: "1.0", task_id: "STALE", prompt: "plan", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["done"], verification: { commands: ["true"] },
+        iteration: { max_iterations: 2 }, execution_policy: { mode: "checkpoint", risk: "medium", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" } };
+      await runCli(f.dir, f.env, [], JSON.stringify(task));
+      const delayed = runCli(f.dir, { ...f.env, SUBAGENT_EXEC_TEST_PRE_LEASE_DELAY_MS: "500" }, ["--continue", "STALE"], JSON.stringify({ schema_version: "1.0", task_id: "STALE", action: "continue", feedback: "stale" }));
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+      const winner = await runCli(f.dir, f.env, ["--continue", "STALE"], JSON.stringify({ schema_version: "1.0", task_id: "STALE", action: "continue", feedback: "winner" }));
+      assert.equal(JSON.parse(winner.stdout).status, "success");
+      const stale = await delayed;
+      assert.equal(JSON.parse(stale.stdout).error.code, "CIRCUIT_BREAKER_OPEN");
+      const prompts = await readFile(f.promptsLog, "utf8");
+      assert.equal((prompts.match(/---PROMPT---/g) ?? []).length, 2);
+    } finally { await f.cleanup(); }
+  });
+
+  test("turns structured architecture handoff into coordinator-required failure", async () => {
+    const f = await fixture();
+    try {
+      const message = `\`\`\`subagent-evidence\n${JSON.stringify({ criteria: [], handoff: { type: "architecture", reason: "choose a storage boundary" } })}\n\`\`\``;
+      const result = JSON.parse((await runCli(f.dir, { ...f.env, PI_MESSAGE: message }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "HANDOFF", prompt: "investigate", cwd: f.dir,
+        scope: "read_only", iteration: { max_iterations: 1 }, execution_policy: { mode: "investigation", risk: "high", on_failure: "return_to_coordinator" }
+      }))).stdout);
+      assert.equal(result.error.code, "ARCHITECTURE_DECISION_REQUIRED");
+      assert.equal(result.continuation.state, "coordinator_required");
     } finally { await f.cleanup(); }
   });
 });

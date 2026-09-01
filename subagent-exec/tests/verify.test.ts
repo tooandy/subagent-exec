@@ -39,6 +39,10 @@ describe("createError", () => {
 });
 
 describe("classifyError", () => {
+  test("returns architecture and requirement decisions to the coordinator", () => {
+    assert.strictEqual(classifyError(new Error("architecture decision needed")).category, "architecture");
+    assert.strictEqual(classifyError(new Error("ambiguous requirement")).category, "requirement");
+  });
   test("classifies 401 as auth error", () => {
     const err = classifyError(new Error("HTTP 401 Unauthorized"));
     assert.strictEqual(err.category, "auth");

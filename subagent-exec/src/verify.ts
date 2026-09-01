@@ -5,12 +5,18 @@ import {
 import type {
   VerificationResult
 } from "./types.js";
+import { sandboxedCommand } from "./containment.js";
+
+export interface VerificationOptions {
+  containment?: { writablePaths: string[] };
+}
 
 export async function runVerification(
   cwd: string,
   commands: string[],
   timeoutMs = 120_000,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  options: VerificationOptions = {}
 ): Promise<VerificationResult> {
 
   if (commands.length === 0) {
@@ -58,7 +64,8 @@ export async function runVerification(
       command,
       cwd,
       timeoutMs,
-      abortSignal
+      abortSignal,
+      options
     );
 
     results.push(result);
@@ -102,7 +109,8 @@ async function runOneCommand(
   command: string,
   cwd: string,
   timeoutMs: number,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  options: VerificationOptions = {}
 ): Promise<CommandResult> {
 
   const started = Date.now();
@@ -111,9 +119,12 @@ async function runOneCommand(
    * We use spawn (not exec) so that we can kill the
    * child process if cancellation or timeout fires.
    */
-  const child = spawn(command, {
+  const invocation = options.containment
+    ? sandboxedCommand("/bin/sh", ["-c", command], options.containment.writablePaths)
+    : { executable: command, args: [] };
+  const child = spawn(invocation.executable, invocation.args, {
     cwd,
-    shell: true,
+    shell: options.containment ? false : true,
     stdio: ["ignore", "pipe", "pipe"]
   });
 

@@ -194,6 +194,23 @@ The worker should produce a candidate patch that passes:
 Only then should the coordinator review and accept the patch. Failed or rejected
 attempts must be disposable without modifying the user's working tree.
 
+### Phase 5 exit criteria
+
+- Every write-capable Worker runs in a detached disposable Git worktree.
+- Scope, budgets, verification, and evidence are evaluated in that worktree.
+- Worker and verification subprocess writes are OS-contained to the candidate
+  and task session storage; unsupported platforms fail closed.
+- A successful candidate exports a binary-capable patch while the main working
+  tree remains unchanged.
+- Binary candidates require explicit policy opt-in, and candidate symlinks may
+  not resolve outside the disposable worktree.
+- Terminal failures discard their worktree; repairable failures retain it for
+  the one bounded continuation.
+- Applying a candidate requires an explicit coordinator command that first
+  performs `git apply --check` and cannot apply the same patch twice.
+- Contract, guidance, and integration tests cover accept, reject, repair, and
+  conflict behavior.
+
 ## Phase 6: Cost and outcome measurement
 
 Measure whether delegation saves coordinator effort instead of assuming it does.

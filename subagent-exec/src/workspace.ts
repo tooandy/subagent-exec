@@ -46,8 +46,23 @@ export async function countDiffLines(
   files: string[],
   baseline?: WorkspaceBaseline
 ): Promise<number> {
-  if (files.length === 0) return 0;
+  const measurement = await measureDiff(cwd, files, baseline);
+  return measurement.hasBinary ? Number.MAX_SAFE_INTEGER : measurement.textDiffLines;
+}
+
+export interface DiffMeasurement {
+  textDiffLines: number;
+  hasBinary: boolean;
+}
+
+export async function measureDiff(
+  cwd: string,
+  files: string[],
+  baseline?: WorkspaceBaseline
+): Promise<DiffMeasurement> {
+  if (files.length === 0) return { textDiffLines: 0, hasBinary: false };
   let total = 0;
+  let hasBinary = false;
   const remaining: string[] = [];
   for (const file of files) {
     if (!baseline?.dirtyPaths.has(file)) {
@@ -57,10 +72,10 @@ export async function countDiffLines(
     const before = baseline.contents.get(file) ?? null;
     let after: Buffer | null = null;
     try { after = await readFile(resolve(cwd, file)); } catch { /* deleted */ }
-    if (isBinary(before) || isBinary(after)) return Number.MAX_SAFE_INTEGER;
+    if (isBinary(before) || isBinary(after)) { hasBinary = true; continue; }
     total += changedTextLines(before, after);
   }
-  if (remaining.length === 0) return total;
+  if (remaining.length === 0) return { textDiffLines: total, hasBinary };
   const outputs = await Promise.all([
     git(cwd, ["diff", "HEAD", "--numstat", "--", ...remaining])
   ]);
@@ -70,7 +85,7 @@ export async function countDiffLines(
     const [added, deleted, path] = line.split("\t");
     if (path) tracked.add(path);
     if (added === "-" || deleted === "-") {
-      total = Number.MAX_SAFE_INTEGER;
+      hasBinary = true;
     } else {
       total += (Number(added) || 0) + (Number(deleted) || 0);
     }
@@ -79,13 +94,13 @@ export async function countDiffLines(
     if (tracked.has(file)) continue;
     try {
       const content = await readFile(resolve(cwd, file));
-      if (isBinary(content)) return Number.MAX_SAFE_INTEGER;
+      if (isBinary(content)) { hasBinary = true; continue; }
       total += textLines(content).length;
     } catch {
       // Deleted files are already represented by git numstat.
     }
   }
-  return total;
+  return { textDiffLines: total, hasBinary };
 }
 
 function isBinary(content: Buffer | null): boolean {

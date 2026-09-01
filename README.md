@@ -22,6 +22,7 @@ It owns:
 - Timeout (per-task) and cancellation (SIGINT/SIGTERM)
 - Token / cost usage capture
 - Workspace scope verification
+- Disposable write candidates with OS-contained Worker and verification processes
 - Verification command execution
 - Structured error classification
 - Delegation admission and change-budget enforcement
@@ -82,6 +83,13 @@ Continue an existing task:
 subagent-exec --continue TASK-123 --feedback feedback.json
 ```
 
+Apply a reviewed isolated candidate:
+
+```bash
+subagent-exec --accept-candidate TASK-123
+subagent-exec --reject-candidate TASK-123
+```
+
 Runtime metadata and Pi transcripts live separately under
 `<cwd>/.subagent-exec/{metadata,pi-sessions}`. This directory can contain full
 prompts and worker output, is ignored by Git, and should be removed or archived
@@ -107,6 +115,10 @@ requirement, or non-retryable runtime failures, and after repeated failure or
 unchanged diagnostics. Optional direct-cost estimates and ratios provide a
 worker-cost circuit. Successful and terminal metadata is archived under
 `.subagent-exec/archive`; only actionable sessions stay active.
+
+Write-capable Workers run in disposable detached Git worktrees. A successful
+Result points to a candidate patch; the main checkout changes only after the
+coordinator explicitly accepts it. Failed candidates are discarded.
 
 ## Run
 

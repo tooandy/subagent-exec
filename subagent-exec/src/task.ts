@@ -74,6 +74,7 @@ const TaskSchema = z.object({
     risk: z.enum(["low", "medium", "high"]),
     max_changed_files: z.number().int().positive().optional(),
     max_diff_lines: z.number().int().positive().optional(),
+    allow_binary_changes: z.boolean().optional(),
     estimated_direct_cost_usd: z.number().positive().optional(),
     max_cost_ratio: z.number().positive().max(1).optional(),
     on_failure: z.literal("return_to_coordinator")

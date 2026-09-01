@@ -52,6 +52,7 @@ const SessionMetadataSchema = z.object({
     reason: z.enum(["scope_violation", "budget_exceeded", "repeated_failure", "no_new_diagnostics", "coordinator_required", "iteration_limit"]).optional(),
     failure_class: z.string().optional()
   }).optional(),
+  candidate_worktree: z.string().min(1).optional(),
   cwd: z.string().min(1),
   created_at: z.string().datetime(),
   updated_at: z.string().datetime(),
@@ -74,6 +75,7 @@ const SessionMetadataSchema = z.object({
       risk: z.enum(["low", "medium", "high"]),
       max_changed_files: z.number().int().positive().optional(),
       max_diff_lines: z.number().int().positive().optional(),
+      allow_binary_changes: z.boolean().optional(),
       estimated_direct_cost_usd: z.number().positive().optional(),
       max_cost_ratio: z.number().positive().max(1).optional(),
       on_failure: z.literal("return_to_coordinator")
@@ -262,6 +264,7 @@ export function withIteration(
     increment_iteration: boolean;
     failure_history?: SessionMetadata["failure_history"];
     circuit?: SessionMetadata["circuit"];
+    candidate_worktree?: string | null;
   }
 ): SessionMetadata {
   return {
@@ -277,6 +280,9 @@ export function withIteration(
       update.last_result ?? prev.last_result,
     failure_history: update.failure_history ?? prev.failure_history,
     circuit: update.circuit ?? prev.circuit,
+    candidate_worktree: update.candidate_worktree === null
+      ? undefined
+      : update.candidate_worktree ?? prev.candidate_worktree,
     updated_at: new Date().toISOString()
   };
 }

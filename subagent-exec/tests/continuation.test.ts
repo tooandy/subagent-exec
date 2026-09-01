@@ -1,22 +1,35 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { describe, test } from "node:test";
 
 const cli = resolve(process.cwd(), "dist/cli.js");
 
 async function fixture(mode = "success") {
-  const dir = await mkdtemp(join(tmpdir(), "subagent-cli-"));
-  const argsLog = `${dir}.args.log`;
-  const promptsLog = `${dir}.prompts.log`;
+  const fixtureRoot = join(process.cwd(), ".test-fixtures");
+  await mkdir(fixtureRoot, { recursive: true });
+  const dir = await mkdtemp(join(fixtureRoot, "subagent-cli-"));
+  await writeFile(join(dir, "package.json"), JSON.stringify({ type: "commonjs" }));
+  const logRoot = join(dir, ".subagent-exec", "pi-sessions");
+  await mkdir(logRoot, { recursive: true });
+  const argsLog = join(logRoot, "test-args.log");
+  const promptsLog = join(logRoot, "test-prompts.log");
+  const outsideArgsLog = `${dir}.args.log`;
+  const outsidePromptsLog = `${dir}.prompts.log`;
+  await writeFile(argsLog, "");
+  await writeFile(promptsLog, "");
+  await writeFile(outsideArgsLog, "");
+  await writeFile(outsidePromptsLog, "");
   const bin = join(dir, "bin");
   await mkdir(bin);
   const pi = join(bin, "pi");
   await writeFile(pi, `#!/usr/bin/env node
 const fs = require("node:fs");
-fs.appendFileSync(process.env.PI_ARGS_LOG, JSON.stringify(process.argv.slice(2)) + "\\n");
+const contained = process.cwd().includes("subagent-candidate-");
+const argsLog = contained ? process.env.PI_CONTAINED_ARGS_LOG : process.env.PI_ARGS_LOG;
+const promptsLog = contained ? process.env.PI_CONTAINED_PROMPTS_LOG : process.env.PI_PROMPTS_LOG;
+fs.appendFileSync(argsLog, JSON.stringify(process.argv.slice(2)) + "\\n");
 let buffer = "";
 process.stdin.on("data", (chunk) => {
   buffer += chunk.toString();
@@ -27,9 +40,22 @@ process.stdin.on("data", (chunk) => {
     const command = JSON.parse(line);
     if (command.type === "prompt") {
       const answer = process.env.PI_MESSAGE || "done";
-      fs.appendFileSync(process.env.PI_PROMPTS_LOG, command.message + "\\n---PROMPT---\\n");
-      if (process.env.PI_TOUCH) fs.writeFileSync(process.env.PI_TOUCH, "one\\ntwo\\n");
-      if (process.env.PI_TOUCH_SECOND) fs.writeFileSync(process.env.PI_TOUCH_SECOND, "three\\n");
+      fs.appendFileSync(promptsLog, command.message + "\\n---PROMPT---\\n");
+      if (process.env.PI_TOUCH) fs.writeFileSync(require("node:path").basename(process.env.PI_TOUCH), "one\\ntwo\\n");
+      if (process.env.PI_TOUCH_SECOND) fs.writeFileSync(require("node:path").basename(process.env.PI_TOUCH_SECOND), "three\\n");
+      if (process.env.PI_ESCAPE) fs.writeFileSync(process.env.PI_ESCAPE, "escaped");
+      if (process.env.PI_SYMLINK_ESCAPE) {
+        fs.symlinkSync(process.env.PI_SYMLINK_ESCAPE, "worker-escape-link");
+        fs.writeFileSync("worker-escape-link", "escaped");
+      }
+      if (process.env.PI_MUTATION_MODE === "binary") fs.writeFileSync("binary.bin", Buffer.from([0,1,2,255]));
+      if (process.env.PI_MUTATION_MODE === "mixed") {
+        fs.writeFileSync("binary.bin", Buffer.from([0,1,2,255]));
+        fs.writeFileSync("large.txt", "one\\ntwo\\nthree\\nfour\\n");
+      }
+      if (process.env.PI_MUTATION_MODE === "delete") fs.unlinkSync("tracked.txt");
+      if (process.env.PI_MUTATION_MODE === "rename") fs.renameSync("tracked.txt", "renamed.txt");
+      if (process.env.PI_MUTATION_MODE === "escape-symlink") fs.symlinkSync(process.env.PI_SYMLINK_TARGET, "escape-link");
       process.stdout.write(JSON.stringify({type:"response",id:command.id,success:true})+"\\n");
       if (process.env.PI_EXIT_EARLY) process.exit(7);
       if ((process.env.PI_MODE || ${JSON.stringify(mode)}) !== "hang") {
@@ -58,11 +84,14 @@ process.stdin.on("data", (chunk) => {
     dir,
     argsLog,
     promptsLog,
-    env: { ...process.env, PI_ARGS_LOG: argsLog, PI_PROMPTS_LOG: promptsLog, PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` },
+    env: { ...process.env, PI_ARGS_LOG: outsideArgsLog, PI_PROMPTS_LOG: outsidePromptsLog,
+      PI_CONTAINED_ARGS_LOG: argsLog, PI_CONTAINED_PROMPTS_LOG: promptsLog, PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` },
     cleanup: async () => {
       await rm(dir, { recursive: true, force: true });
       await rm(argsLog, { force: true });
       await rm(promptsLog, { force: true });
+      await rm(outsideArgsLog, { force: true });
+      await rm(outsidePromptsLog, { force: true });
     }
   };
 }
@@ -116,7 +145,7 @@ describe("continuation CLI integration", () => {
       assert.equal(rejected.error.code, "DELEGATION_NOT_RECOMMENDED");
       assert.equal(rejected.acceptance_evidence.criteria[0].criterion, "must remain visible");
       assert.ok(rejected.acceptance_evidence.recommended_next_action);
-      await assert.rejects(() => readFile(f.argsLog, "utf8"));
+      assert.equal(await readFile(f.argsLog, "utf8"), "");
     } finally { await f.cleanup(); }
   });
 
@@ -129,26 +158,28 @@ describe("continuation CLI integration", () => {
         schema_version: "1.0", task_id: "LOCK-FAIL", prompt: "x", cwd: f.dir
       }));
       assert.equal(JSON.parse(result.stdout).error.code, "SESSION_LEASE_ERROR");
-      await assert.rejects(() => readFile(f.argsLog, "utf8"));
+      assert.equal(await readFile(f.argsLog, "utf8"), "");
     } finally { await f.cleanup(); }
   });
 
   test("starts then resumes the exact same session and reruns verification", async () => {
     const f = await fixture();
     try {
+      const verificationLog = join(f.dir, ".subagent-exec", "pi-sessions", "verified.log");
+      await mkdir(join(f.dir, ".subagent-exec", "pi-sessions"), { recursive: true });
       const task = {
         schema_version: "1.0", task_id: "FLOW-1", prompt: "first", cwd: f.dir,
         scope: "read_write", constraints: ["stay read-only"],
         acceptance_criteria: ["return a concise result"], iteration: { max_iterations: 2 },
-        verification: { commands: ["node -e \"require('fs').appendFileSync('verified.log','v')\""] }
+        verification: { commands: [`node -e "require('fs').appendFileSync('${verificationLog}','v')"`] }
       };
       const first = await runCli(f.dir, f.env, [], JSON.stringify(task));
       assert.equal(first.code, 0, first.stderr);
       const continued = await runCli(f.dir, f.env, ["--continue", "FLOW-1"], JSON.stringify({
         schema_version: "1.0", task_id: "FLOW-1", action: "continue", feedback: "review feedback"
       }));
-      assert.equal(continued.code, 0, continued.stderr);
-      assert.equal(await readFile(join(f.dir, "verified.log"), "utf8"), "v");
+      assert.equal(continued.code, 0, `${continued.stderr}\n${continued.stdout}`);
+      assert.equal(await readFile(verificationLog, "utf8"), "v");
       const args = (await readFile(f.argsLog, "utf8")).trim().split("\n").map(JSON.parse);
       const createdId = args[0][args[0].indexOf("--session-id") + 1];
       const resumedId = args[1][args[1].indexOf("--session") + 1];
@@ -215,13 +246,18 @@ describe("continuation CLI integration", () => {
       const metadataPath = join(f.dir, ".subagent-exec", "metadata", "DIR-1.json");
       const metadata = JSON.parse(await readFile(metadataPath, "utf8"));
       metadata.worker_session_dir = join(f.dir, "persisted-pi-dir");
+      await mkdir(metadata.worker_session_dir, { recursive: true });
+      const continuedArgsLog = join(metadata.worker_session_dir, "args.log");
+      const continuedPromptsLog = join(metadata.worker_session_dir, "prompts.log");
+      await writeFile(continuedArgsLog, "");
+      await writeFile(continuedPromptsLog, "");
       await writeFile(metadataPath, JSON.stringify(metadata), "utf8");
-      const continued = await runCli(f.dir, f.env, ["--continue", "DIR-1"], JSON.stringify({
+      const continued = await runCli(f.dir, { ...f.env, PI_CONTAINED_ARGS_LOG: continuedArgsLog, PI_CONTAINED_PROMPTS_LOG: continuedPromptsLog }, ["--continue", "DIR-1"], JSON.stringify({
         schema_version: "1.0", task_id: "DIR-1", action: "continue", feedback: "x"
       }));
       assert.equal(continued.code, 0, continued.stderr);
-      const args = (await readFile(f.argsLog, "utf8")).trim().split("\n").map(JSON.parse);
-      assert.equal(args[1][args[1].indexOf("--session-dir") + 1], metadata.worker_session_dir);
+      const args = JSON.parse((await readFile(continuedArgsLog, "utf8")).trim());
+      assert.equal(args[args.indexOf("--session-dir") + 1], metadata.worker_session_dir);
     } finally { await f.cleanup(); }
   });
 
@@ -320,7 +356,8 @@ describe("continuation CLI integration", () => {
   test("runs inherited verification even when continuation violates scope", async () => {
     const f = await fixture();
     try {
-      const verificationLog = `${f.dir}.scope-verified`;
+      const verificationLog = join(f.dir, ".subagent-exec", "pi-sessions", "scope-verified");
+      await mkdir(join(f.dir, ".subagent-exec", "pi-sessions"), { recursive: true });
       const first = await runCli(f.dir, f.env, [], JSON.stringify({
         schema_version: "1.0", task_id: "SCOPE-CONT", prompt: "x", cwd: f.dir,
         scope: "read_write", allowed_paths: ["tracked.txt"], iteration: { max_iterations: 2 },
@@ -513,8 +550,29 @@ describe("continuation CLI integration", () => {
       await runCli(f.dir, f.env, [], JSON.stringify(task));
       const failed = JSON.parse((await runCli(f.dir, f.env, ["--continue", "NO-REPAIR"], JSON.stringify({ schema_version: "1.0", task_id: "NO-REPAIR", action: "continue", feedback: "implement" }))).stdout);
       assert.equal(failed.continuation.reason, "iteration_limit");
+      assert.equal(failed.candidate.status, "discarded");
       await assert.rejects(() => readFile(join(f.dir, ".subagent-exec", "metadata", "NO-REPAIR.json"), "utf8"));
       assert.ok(await readFile(join(f.dir, ".subagent-exec", "archive", "NO-REPAIR.json"), "utf8"));
+    } finally { await f.cleanup(); }
+  });
+
+  test("retains an isolated candidate for one repair and exports it on success", async () => {
+    const f = await fixture();
+    try {
+      const marker = join(f.dir, ".subagent-exec", "pi-sessions", "repair-marker");
+      await mkdir(join(f.dir, ".subagent-exec", "pi-sessions"), { recursive: true });
+      const command = `node -e "const fs=require('fs'); if(fs.existsSync('${marker}')) process.exit(0); fs.writeFileSync('${marker}','1'); process.exit(1)"`;
+      const evidence = `\`\`\`subagent-evidence\n${JSON.stringify({ criteria: [{ criterion: "passes", status: "passed", evidence: [{ type: "command", reference: command }] }] })}\n\`\`\``;
+      const task = { schema_version: "1.0", task_id: "CANDIDATE-REPAIR", prompt: "plan", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["passes"], verification: { commands: [command] },
+        iteration: { max_iterations: 3 }, execution_policy: { mode: "checkpoint", risk: "medium", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" } };
+      await runCli(f.dir, f.env, [], JSON.stringify(task));
+      const first = JSON.parse((await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt", PI_MESSAGE: evidence }, ["--continue", "CANDIDATE-REPAIR"], JSON.stringify({ schema_version: "1.0", task_id: "CANDIDATE-REPAIR", action: "continue", feedback: "implement" }))).stdout);
+      assert.equal(first.candidate.status, "pending");
+      const repaired = JSON.parse((await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt", PI_MESSAGE: evidence }, ["--continue", "CANDIDATE-REPAIR"], JSON.stringify({ schema_version: "1.0", task_id: "CANDIDATE-REPAIR", action: "continue", feedback: "repair" }))).stdout);
+      assert.equal(repaired.status, "success");
+      assert.equal(repaired.candidate.status, "ready");
+      assert.equal(await readFile(join(f.dir, "tracked.txt"), "utf8"), "base");
     } finally { await f.cleanup(); }
   });
 
@@ -561,6 +619,178 @@ describe("continuation CLI integration", () => {
       }))).stdout);
       assert.equal(result.error.code, "ARCHITECTURE_DECISION_REQUIRED");
       assert.equal(result.continuation.state, "coordinator_required");
+    } finally { await f.cleanup(); }
+  });
+
+  test("keeps candidate changes isolated until explicit acceptance", async () => {
+    const f = await fixture();
+    try {
+      const evidence = `\`\`\`subagent-evidence\n${JSON.stringify({ criteria: [{ criterion: "changed", status: "passed", evidence: [{ type: "command", reference: "true" }] }] })}\n\`\`\``;
+      const result = JSON.parse((await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt", PI_MESSAGE: evidence }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "ISOLATED", prompt: "edit", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["changed"],
+        verification: { commands: ["true"] }, iteration: { max_iterations: 1 },
+        execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }))).stdout);
+      assert.equal(result.status, "success");
+      assert.equal(result.candidate.status, "ready");
+      assert.equal(await readFile(join(f.dir, "tracked.txt"), "utf8"), "base");
+      const accepted = await runCli(f.dir, f.env, ["--accept-candidate", "ISOLATED"]);
+      assert.equal(JSON.parse(accepted.stdout).status, "accepted");
+      assert.equal(await readFile(join(f.dir, "tracked.txt"), "utf8"), "one\ntwo\n");
+      const duplicate = await runCli(f.dir, f.env, ["--accept-candidate", "ISOLATED"]);
+      assert.equal(JSON.parse(duplicate.stdout).error.code, "CANDIDATE_APPLY_FAILED");
+    } finally { await f.cleanup(); }
+  });
+
+  test("discards a rejected candidate without changing the main workspace", async () => {
+    const f = await fixture();
+    try {
+      const result = JSON.parse((await runCli(f.dir, { ...f.env, PI_TOUCH: "outside.txt" }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "DISCARD", prompt: "edit", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["changed"],
+        verification: { commands: ["true"] }, iteration: { max_iterations: 1 },
+        execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }))).stdout);
+      assert.equal(result.candidate.status, "discarded");
+      await assert.rejects(() => readFile(join(f.dir, "outside.txt"), "utf8"));
+    } finally { await f.cleanup(); }
+  });
+
+  test("coordinator explicitly rejects a ready candidate", async () => {
+    const f = await fixture();
+    try {
+      const evidence = `\`\`\`subagent-evidence\n${JSON.stringify({ criteria: [{ criterion: "changed", status: "passed", evidence: [{ type: "command", reference: "true" }] }] })}\n\`\`\``;
+      await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt", PI_MESSAGE: evidence }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "REJECT-CANDIDATE", prompt: "edit", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["changed"],
+        verification: { commands: ["true"] }, iteration: { max_iterations: 1 },
+        execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }));
+      const rejected = await runCli(f.dir, f.env, ["--reject-candidate", "REJECT-CANDIDATE"]);
+      assert.equal(JSON.parse(rejected.stdout).status, "rejected");
+      assert.equal(await readFile(join(f.dir, "tracked.txt"), "utf8"), "base");
+    } finally { await f.cleanup(); }
+  });
+
+  test("verification side effects are included in final scope validation", async () => {
+    const f = await fixture();
+    try {
+      const result = JSON.parse((await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt" }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "VERIFY-SCOPE", prompt: "edit", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["changed"],
+        verification: { commands: ["node -e \"require('fs').writeFileSync('outside.txt','bad')\""] }, iteration: { max_iterations: 1 },
+        execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }))).stdout);
+      assert.equal(result.error.code, "MODIFICATION_SCOPE_VIOLATION");
+      assert.equal(result.candidate.status, "discarded");
+      await assert.rejects(() => readFile(join(f.dir, "outside.txt"), "utf8"));
+    } finally { await f.cleanup(); }
+  });
+
+  test("OS containment blocks planning, absolute-path, and symlink escapes", async () => {
+    for (const attack of ["planning", "absolute", "symlink"] as const) {
+      const f = await fixture();
+      try {
+        const escaped = join(f.dir, `${attack}-escaped.txt`);
+        const checkpoint = attack === "planning";
+        const env = attack === "symlink" ? { ...f.env, PI_SYMLINK_ESCAPE: escaped } : { ...f.env, PI_ESCAPE: escaped };
+        const task = { schema_version: "1.0", task_id: `ESCAPE-${attack}`, prompt: "attempt", cwd: f.dir,
+          scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["safe"], verification: { commands: ["true"] },
+          iteration: { max_iterations: checkpoint ? 2 : 1 }, execution_policy: { mode: checkpoint ? "checkpoint" : "fast", risk: checkpoint ? "medium" : "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" } };
+        const result = JSON.parse((await runCli(f.dir, env, [], JSON.stringify(task))).stdout);
+        assert.equal(result.status, "failed");
+        await assert.rejects(() => readFile(escaped, "utf8"));
+      } finally { await f.cleanup(); }
+    }
+  });
+
+  test("exports and accepts binary, deletion, and rename candidates", async () => {
+    for (const mode of ["binary", "delete", "rename"] as const) {
+      const f = await fixture();
+      try {
+        const evidence = `\`\`\`subagent-evidence\n${JSON.stringify({ criteria: [{ criterion: "mutation", status: "passed", evidence: [{ type: "command", reference: "true" }] }] })}\n\`\`\``;
+        const allowed = mode === "binary" ? ["binary.bin"] : mode === "rename" ? ["tracked.txt", "renamed.txt"] : ["tracked.txt"];
+        const taskId = `PATCH-${mode}`;
+        const result = JSON.parse((await runCli(f.dir, { ...f.env, PI_MUTATION_MODE: mode, PI_MESSAGE: evidence }, [], JSON.stringify({
+          schema_version: "1.0", task_id: taskId, prompt: "mutate", cwd: f.dir,
+          scope: "read_write", allowed_paths: allowed, acceptance_criteria: ["mutation"], verification: { commands: ["true"] },
+          iteration: { max_iterations: 1 }, execution_policy: { mode: "fast", risk: "low", max_changed_files: 2, max_diff_lines: 20,
+            allow_binary_changes: mode === "binary", on_failure: "return_to_coordinator" }
+        }))).stdout);
+        assert.equal(result.candidate.status, "ready", JSON.stringify(result));
+        assert.equal(JSON.parse((await runCli(f.dir, f.env, ["--accept-candidate", taskId])).stdout).status, "accepted");
+        if (mode === "binary") assert.deepEqual(await readFile(join(f.dir, "binary.bin")), Buffer.from([0,1,2,255]));
+        if (mode === "delete") await assert.rejects(() => readFile(join(f.dir, "tracked.txt")));
+        if (mode === "rename") assert.equal(await readFile(join(f.dir, "renamed.txt"), "utf8"), "base");
+      } finally { await f.cleanup(); }
+    }
+  });
+
+  test("rejects candidate artifacts containing an escaping symlink", async () => {
+    const f = await fixture();
+    try {
+      const evidence = `\`\`\`subagent-evidence\n${JSON.stringify({ criteria: [{ criterion: "safe link", status: "passed", evidence: [{ type: "command", reference: "true" }] }] })}\n\`\`\``;
+      const result = JSON.parse((await runCli(f.dir, { ...f.env, PI_MUTATION_MODE: "escape-symlink", PI_SYMLINK_TARGET: join(f.dir, "tracked.txt"), PI_MESSAGE: evidence }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "ESCAPING-LINK", prompt: "link", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["escape-link"], acceptance_criteria: ["safe link"], verification: { commands: ["true"] },
+        iteration: { max_iterations: 1 }, execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }))).stdout);
+      assert.equal(result.status, "failed");
+      assert.equal(result.error.code, "CANDIDATE_EXPORT_FAILED");
+      assert.equal(result.candidate.status, "discarded");
+    } finally { await f.cleanup(); }
+  });
+
+  test("binary opt-in never bypasses the text line budget", async () => {
+    const f = await fixture();
+    try {
+      const result = JSON.parse((await runCli(f.dir, { ...f.env, PI_MUTATION_MODE: "mixed" }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "MIXED-BUDGET", prompt: "mixed", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["binary.bin", "large.txt"], acceptance_criteria: ["bounded"], verification: { commands: ["true"] },
+        iteration: { max_iterations: 1 }, execution_policy: { mode: "fast", risk: "low", max_changed_files: 2,
+          max_diff_lines: 2, allow_binary_changes: true, on_failure: "return_to_coordinator" }
+      }))).stdout);
+      assert.equal(result.status, "failed");
+      assert.equal(result.error.code, "CHANGE_BUDGET_EXCEEDED");
+      assert.equal(result.error.details.has_binary, true);
+      assert.equal(result.error.details.diff_lines, 4);
+    } finally { await f.cleanup(); }
+  });
+
+  test("contains verification subprocess writes outside the candidate", async () => {
+    const f = await fixture();
+    try {
+      const escaped = join(f.dir, "verification-escaped.txt");
+      const script = `require("node:child_process").execFileSync(process.execPath,["-e",${JSON.stringify(`require("node:fs").writeFileSync(${JSON.stringify(escaped)},"escaped")`)}])`;
+      const result = JSON.parse((await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt" }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "VERIFY-CONTAINMENT", prompt: "edit", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["safe"],
+        verification: { commands: [`node -e ${JSON.stringify(script)}`] }, iteration: { max_iterations: 1 },
+        execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }))).stdout);
+      assert.equal(result.status, "failed");
+      assert.equal(result.verification.status, "failed");
+      await assert.rejects(() => readFile(escaped, "utf8"));
+    } finally { await f.cleanup(); }
+  });
+
+  test("refuses conflicting and path-traversing candidate acceptance", async () => {
+    const f = await fixture();
+    try {
+      const evidence = `\`\`\`subagent-evidence\n${JSON.stringify({ criteria: [{ criterion: "changed", status: "passed", evidence: [{ type: "command", reference: "true" }] }] })}\n\`\`\``;
+      await runCli(f.dir, { ...f.env, PI_TOUCH: "tracked.txt", PI_MESSAGE: evidence }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "CONFLICT", prompt: "edit", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["changed"],
+        verification: { commands: ["true"] }, iteration: { max_iterations: 1 },
+        execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }));
+      await writeFile(join(f.dir, "tracked.txt"), "user edit\n");
+      const conflict = await runCli(f.dir, f.env, ["--accept-candidate", "CONFLICT"]);
+      assert.equal(JSON.parse(conflict.stdout).error.code, "CANDIDATE_APPLY_FAILED");
+      assert.equal(await readFile(join(f.dir, "tracked.txt"), "utf8"), "user edit\n");
+      const traversal = await runCli(f.dir, f.env, ["--accept-candidate", "../escape"]);
+      assert.equal(JSON.parse(traversal.stdout).error.code, "CANDIDATE_APPLY_FAILED");
     } finally { await f.cleanup(); }
   });
 });

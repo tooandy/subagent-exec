@@ -42,6 +42,7 @@ import {
 
 import {
   spawnPi,
+  supportsWriteContainment,
   type PiProcess
 } from "./process.js";
 
@@ -60,7 +61,7 @@ import {
 import {
   captureBaseline,
   checkScope,
-  countDiffLines,
+  measureDiff,
   WorkspaceError,
   type WorkspaceBaseline
 } from "./workspace.js";
@@ -83,7 +84,8 @@ import {
   updateRpcState,
   type RpcState
 } from "./result.js";
-import { canContinueSession, diagnosticFingerprint, failureClass } from "./circuit.js";
+import { canContinueSession, diagnosticFingerprint, evaluateResultCircuit, failureClass } from "./circuit.js";
+import { acceptCandidate, createCandidateWorktree, discardCandidate, exportCandidatePatch, rejectCandidate } from "./candidate.js";
 
 import type {
   ExecutionInfo,
@@ -211,6 +213,10 @@ OPTIONS
   --task <path>      Load Task Contract from a JSON file.
                      If omitted, reads from stdin.
   --continue <id>    Continue the exact persisted session for task id.
+  --accept-candidate <id>
+                     Apply a reviewed candidate patch to the main workspace.
+  --reject-candidate <id>
+                     Reject a candidate patch without changing the workspace.
   --feedback <path>  Load Continue Task feedback JSON from a file.
   --task-id <id>     Override task_id validation.
   --help, -h         Print this usage message and exit.
@@ -404,6 +410,43 @@ async function persistAndArchiveIfTerminal(session: SessionMetadata, result: Wor
   if (!result.continuation.allow_continuation) await archiveSession(session.cwd, session.task_id);
 }
 
+async function prepareCandidateResult(session: SessionMetadata, result: WorkerResult): Promise<void> {
+  const worktree = session.candidate_worktree;
+  if (!worktree) return;
+  if (result.status === "success" && result.scope.changed_files.length > 0 &&
+      result.acceptance_evidence.criteria.some((item) => item.status !== "passed")) {
+    result.status = "failed";
+    result.error = createError("verification", "ACCEPTANCE_EVIDENCE_INCOMPLETE",
+      "Candidate changes lack reproducible passed evidence for every acceptance criterion", { retryable: false });
+    result.acceptance_evidence.recommended_next_action ??= "Return to the coordinator for evidence review.";
+    result.continuation = evaluateResultCircuit(result, session.failure_history);
+    const limit = session.original_task.iteration?.max_iterations ?? 1;
+    if (result.continuation.allow_continuation && result.iteration >= limit) {
+      result.continuation = { allow_continuation: false, state: "coordinator_required", reason: "iteration_limit", failure_class: result.continuation.failure_class };
+    }
+  }
+  if (result.status === "success") {
+    try {
+      const patchPath = await exportCandidatePatch(session.cwd, worktree, session.task_id);
+      result.candidate = { status: "ready", patch_path: patchPath };
+      await discardCandidate(session.cwd, worktree);
+      session.candidate_worktree = undefined;
+    } catch (error) {
+      result.status = "failed";
+      result.error = createError("runtime", "CANDIDATE_EXPORT_FAILED", String(error), { retryable: false });
+      result.continuation = { allow_continuation: false, state: "coordinator_required", reason: "coordinator_required", failure_class: "runtime:CANDIDATE_EXPORT_FAILED" };
+      result.candidate = { status: "discarded" };
+      try { await discardCandidate(session.cwd, worktree); session.candidate_worktree = undefined; } catch { /* surfaced by export failure */ }
+    }
+  } else if (!result.continuation.allow_continuation) {
+    await discardCandidate(session.cwd, worktree);
+    session.candidate_worktree = undefined;
+    result.candidate = { status: "discarded" };
+  } else {
+    result.candidate = { status: "pending" };
+  }
+}
+
 function applySessionPersistenceFailure(
   result: WorkerResult,
   error: unknown
@@ -560,6 +603,41 @@ function classifyStderrLine(line: string): WorkerError | null {
 }
 
 async function main(): Promise<void> {
+  const rejectTaskId = getArg("--reject-candidate");
+  if (rejectTaskId) {
+    let release: (() => Promise<void>) | null = null;
+    try {
+      release = await acquireSessionLease(process.cwd(), rejectTaskId);
+      if (!release) throw new Error("candidate is busy");
+      const rejectedPath = await rejectCandidate(process.cwd(), rejectTaskId);
+      printResult({ schema_version: "1.0", task_id: rejectTaskId, status: "rejected", rejected_patch: rejectedPath });
+      process.exitCode = 0;
+    } catch (error) {
+      printResult(createFailedResult(rejectTaskId, createError("runtime", "CANDIDATE_REJECT_FAILED", String(error), { retryable: false }), new Date()));
+      process.exitCode = 1;
+    } finally {
+      await release?.();
+    }
+    return;
+  }
+  const acceptTaskId = getArg("--accept-candidate");
+  if (acceptTaskId) {
+    let release: (() => Promise<void>) | null = null;
+    try {
+      if (!/^[A-Za-z0-9._:-]{1,200}$/.test(acceptTaskId)) throw new Error("invalid candidate task id");
+      release = await acquireSessionLease(process.cwd(), acceptTaskId);
+      if (!release) throw new Error("candidate is busy");
+      const acceptedPath = await acceptCandidate(process.cwd(), acceptTaskId);
+      printResult({ schema_version: "1.0", task_id: acceptTaskId, status: "accepted", accepted_patch: acceptedPath });
+      process.exitCode = 0;
+    } catch (error) {
+      printResult(createFailedResult(acceptTaskId, createError("runtime", "CANDIDATE_APPLY_FAILED", String(error), { retryable: false }), new Date()));
+      process.exitCode = 1;
+    } finally {
+      await release?.();
+    }
+    return;
+  }
   /*
    * Dispatch based on --continue flag.
    *
@@ -697,6 +775,10 @@ async function main(): Promise<void> {
         state: "coordinator_required" as const,
         reason: "iteration_limit" as const
       };
+      if (metadata.candidate_worktree) {
+        await discardCandidate(metadata.cwd, metadata.candidate_worktree);
+        metadata = { ...metadata, candidate_worktree: undefined };
+      }
       await saveSession({ ...metadata, circuit: terminalCircuit, updated_at: new Date().toISOString() });
       await archiveSession(metadata.cwd, metadata.task_id);
       printResult(
@@ -739,6 +821,12 @@ async function main(): Promise<void> {
 
     const circuit = canContinueSession(metadata);
     if (metadata.iteration > 1 && !circuit.allow_continuation) {
+      if (metadata.candidate_worktree) {
+        await discardCandidate(metadata.cwd, metadata.candidate_worktree);
+        metadata = { ...metadata, candidate_worktree: undefined };
+        await saveSession(metadata);
+      }
+      await archiveSession(metadata.cwd, metadata.task_id);
       printResult(createFailedResult(continueTask.task_id, createError(
         "runtime", "CIRCUIT_BREAKER_OPEN",
         `Task "${continueTask.task_id}" requires coordinator takeover (${circuit.reason ?? circuit.state}).`,
@@ -925,7 +1013,7 @@ async function runIteration(
     ? existingSession.cwd
     : resolve(task.cwd ?? process.cwd());
 
-  const session: SessionMetadata =
+  let session: SessionMetadata =
     existingSession ?? newSessionMetadata({ ...task, cwd });
 
   const iterationNumber =
@@ -933,6 +1021,21 @@ async function runIteration(
       ? existingSession.iteration + 1
       : 1;
   const checkpointPlanning = isCheckpointPlanningRound(task, iterationNumber);
+  const isolatedWrite = task.scope === "read_write";
+  let executionCwd = cwd;
+  if (isolatedWrite) {
+    try {
+      if (!supportsWriteContainment()) throw new Error("No supported OS write-containment backend");
+      executionCwd = existingSession?.candidate_worktree ?? await createCandidateWorktree(cwd);
+      session = { ...session, candidate_worktree: executionCwd };
+    } catch (error) {
+      printResult(createFailedResult(task.task_id, createError(
+        "runtime", "CANDIDATE_WORKTREE_FAILED", String(error), { retryable: false }
+      ), new Date(), null, task.acceptance_criteria));
+      process.exitCode = 1;
+      return;
+    }
+  }
   const startedAt = new Date();
   const logger = new Logger(task.task_id);
 
@@ -944,7 +1047,7 @@ async function runIteration(
   let baseline: WorkspaceBaseline;
 
   try {
-    baseline = await captureBaseline(cwd);
+    baseline = await captureBaseline(executionCwd);
   } catch (error) {
     const classified =
       error instanceof WorkspaceError
@@ -956,15 +1059,18 @@ async function runIteration(
           )
         : classifyError(error, "runtime");
 
-    printResult(
-      createFailedResult(
+    const failed = createFailedResult(
         task.task_id,
         classified,
         startedAt,
         null,
         task.acceptance_criteria
-      )
-    );
+      );
+    if (session.candidate_worktree) {
+      try { await discardCandidate(cwd, session.candidate_worktree); (failed as unknown as WorkerResult).candidate = { status: "discarded" }; }
+      catch { /* primary workspace error remains authoritative */ }
+    }
+    printResult(failed);
     process.exitCode = 1;
     return;
   }
@@ -977,11 +1083,12 @@ async function runIteration(
 
   try {
     pi = spawnPi(
-      { ...task, cwd },
+      { ...task, cwd: executionCwd },
       {
         continueFrom: existingSession,
         sessionDir: existingSession?.worker_session_dir ?? resolvePiSessionDir(cwd),
-        sessionId: session.worker_session_id
+        sessionId: session.worker_session_id,
+        containmentRoot: isolatedWrite ? cwd : undefined
       }
     );
     rpc = new PiRpcClient(pi.child);
@@ -991,15 +1098,18 @@ async function runIteration(
       iteration: iterationNumber
     });
   } catch (error) {
-    printResult(
-      createFailedResult(
+    const failed = createFailedResult(
         task.task_id,
         classifyError(error, "runtime"),
         startedAt,
         null,
         task.acceptance_criteria
-      )
-    );
+      );
+    if (session.candidate_worktree) {
+      try { await discardCandidate(cwd, session.candidate_worktree); (failed as unknown as WorkerResult).candidate = { status: "discarded" }; }
+      catch { /* primary spawn error remains authoritative */ }
+    }
+    printResult(failed);
     process.exitCode = 1;
     return;
   }
@@ -1215,6 +1325,7 @@ async function runIteration(
         session.failure_history
       );
     try {
+      await prepareCandidateResult(session, result);
       await persistAndArchiveIfTerminal(session, result);
     } catch (sessionError) {
       applySessionPersistenceFailure(result, sessionError);
@@ -1314,6 +1425,7 @@ async function runIteration(
         session.failure_history
       );
     try {
+      await prepareCandidateResult(session, result);
       await persistAndArchiveIfTerminal(session, result);
     } catch (sessionError) {
       applySessionPersistenceFailure(result, sessionError);
@@ -1445,7 +1557,7 @@ async function runIteration(
 
   try {
     scope = await checkScope(
-      cwd,
+      executionCwd,
       baseline,
       task.allowed_paths ?? [],
       scopeMode
@@ -1529,9 +1641,10 @@ async function runIteration(
   if (!workerError && !checkpointPlanning && task.execution_policy?.mode !== "investigation") {
     const maxFiles = task.execution_policy?.max_changed_files;
     const maxLines = task.execution_policy?.max_diff_lines;
-    const diffLines = await countDiffLines(cwd, scope.changed_files, baseline);
+    const diff = await measureDiff(executionCwd, scope.changed_files, baseline);
     if ((maxFiles !== undefined && scope.changed_files.length > maxFiles) ||
-        (maxLines !== undefined && diffLines > maxLines)) {
+        (diff.hasBinary && task.execution_policy?.allow_binary_changes !== true) ||
+        (maxLines !== undefined && diff.textDiffLines > maxLines)) {
       workerError = createError(
         "scope",
         "CHANGE_BUDGET_EXCEEDED",
@@ -1541,7 +1654,8 @@ async function runIteration(
           details: {
             changed_files: scope.changed_files.length,
             max_changed_files: maxFiles,
-            diff_lines: diffLines,
+            diff_lines: diff.textDiffLines,
+            has_binary: diff.hasBinary,
             max_diff_lines: maxLines
           }
         }
@@ -1563,10 +1677,11 @@ async function runIteration(
 
     try {
       verification = await runVerification(
-        cwd,
+        executionCwd,
         task.verification.commands,
         verifyTimeout,
-        cancellationController.signal
+        cancellationController.signal,
+        isolatedWrite ? { containment: { writablePaths: [executionCwd, session.worker_session_dir] } } : undefined
       );
     } catch (error) {
       verification = {
@@ -1596,6 +1711,31 @@ async function runIteration(
   logger.log("verification_end", {
     status: verification.status
   });
+
+  // Verification commands execute inside the candidate and may themselves
+  // modify files. Recompute scope and budgets from the original baseline so
+  // the exported patch, not merely the pre-verification state, is validated.
+  if (!checkpointPlanning && task.execution_policy?.mode !== "investigation") {
+    try {
+      scope = await checkScope(executionCwd, baseline, task.allowed_paths ?? [], scopeMode);
+      if (scope.status === "failed") {
+        workerError = createError("scope", "MODIFICATION_SCOPE_VIOLATION",
+          "Candidate including verification side effects changed files outside allowed_paths",
+          { retryable: false, details: scope.violations });
+      } else {
+        const finalDiff = await measureDiff(executionCwd, scope.changed_files, baseline);
+        if (scope.changed_files.length > (task.execution_policy?.max_changed_files ?? Number.MAX_SAFE_INTEGER) ||
+            (finalDiff.hasBinary && task.execution_policy?.allow_binary_changes !== true) ||
+            finalDiff.textDiffLines > (task.execution_policy?.max_diff_lines ?? Number.MAX_SAFE_INTEGER)) {
+          workerError = createError("scope", "CHANGE_BUDGET_EXCEEDED",
+            "Candidate including verification side effects exceeded its change budget",
+            { retryable: false, details: { changed_files: scope.changed_files.length, diff_lines: finalDiff.textDiffLines, has_binary: finalDiff.hasBinary } });
+        }
+      }
+    } catch (error) {
+      workerError = createError("runtime", "WORKSPACE_ERROR", String(error), { retryable: false });
+    }
+  }
 
   const costLimit = task.execution_policy?.estimated_direct_cost_usd !== undefined &&
     task.execution_policy.max_cost_ratio !== undefined
@@ -1655,6 +1795,7 @@ async function runIteration(
   }
 
   try {
+    await prepareCandidateResult(session, result);
     await persistAndArchiveIfTerminal(session, result);
   } catch (sessionError) {
     logger.log("session_save_failed", {

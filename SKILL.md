@@ -62,6 +62,10 @@ Continue only when `continuation.allow_continuation` is true. A
 `coordinator_required` state means Codex must take over instead of retrying the
 same Worker session.
 
+For a successful write task, review `candidate.patch_path` before running
+`subagent-exec --accept-candidate <task_id>`. A successful Worker Result alone
+does not authorize applying the patch to the user's checkout.
+
 Workers perform bounded tasks with explicit acceptance criteria.
 
 ## When to Use a Worker
@@ -165,6 +169,7 @@ Example:
     "risk": "low",
     "max_changed_files": 3,
     "max_diff_lines": 300,
+    "allow_binary_changes": false,
     "on_failure": "return_to_coordinator"
   }
 }

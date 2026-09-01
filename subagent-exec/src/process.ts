@@ -6,6 +6,9 @@ import {
 import type { Task } from "./types.js";
 
 import type { SessionMetadata } from "./session.js";
+import { sandboxedCommand } from "./containment.js";
+
+export { supportsWriteContainment } from "./containment.js";
 
 export interface PiProcess {
   child: ChildProcessWithoutNullStreams;
@@ -28,6 +31,7 @@ export interface SpawnOptions {
 
   /** Exact id used when creating a fresh Pi session. */
   sessionId?: string;
+  containmentRoot?: string;
 }
 
 export function spawnPi(
@@ -36,9 +40,16 @@ export function spawnPi(
 ): PiProcess {
   const args = buildPiArgs(task, options);
 
+  let executable = "pi";
+  let spawnArgs = args;
+  if (options.containmentRoot) {
+    const sandboxed = sandboxedCommand("pi", args, [task.cwd, options.sessionDir]);
+    executable = sandboxed.executable;
+    spawnArgs = sandboxed.args;
+  }
   const child = spawn(
-    "pi",
-    args,
+    executable,
+    spawnArgs,
     {
       cwd: task.cwd ?? process.cwd(),
       stdio: ["pipe", "pipe", "pipe"],

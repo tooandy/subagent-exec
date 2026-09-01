@@ -79,6 +79,7 @@ overwrite constraints by editing the prompt.
 | `risk` | enum | `low`, `medium`, or `high`; constrained by mode. |
 | `max_changed_files` | integer | Required positive file budget for implementation modes. |
 | `max_diff_lines` | integer | Required positive changed-line budget for implementation modes. |
+| `allow_binary_changes` | boolean | Optional, defaults to `false`. Must be explicitly enabled because binary changes cannot be bounded by changed-line count. File-count and path limits still apply. |
 | `estimated_direct_cost_usd` | number | Optional direct-execution cost estimate; paired with `max_cost_ratio`. |
 | `max_cost_ratio` | number | Optional worker/direct cost ceiling in `(0,1]`; paired with the estimate. |
 | `on_failure` | enum | V1 requires `return_to_coordinator`. |
@@ -198,6 +199,7 @@ Runtime state is stored under `<cwd>/.subagent-exec/`: contract metadata in
 | `verification` | object | Verification command results. |
 | `acceptance_evidence` | object | Structured criterion evidence and review guidance. |
 | `continuation` | object | Circuit state, permission, failure class, and stop reason. |
+| `candidate` | object | Isolated state (`pending`, `ready`, or `discarded`) and optional patch path. |
 | `usage` | object or null | Token / cost usage (may be null if unavailable). |
 | `iteration` | integer | Current one-based session round. |
 | `needs_continuation` | object | Present when a Checkpoint plan awaits coordinator review. |
@@ -408,6 +410,34 @@ Cost limits apply whenever Pi reports usage stats, including when another
 failure occurred in the same round, and take terminal precedence. If a process
 ends before stats are available, the runtime cannot infer unreported cost and
 the other stop rule governs that round.
+
+### isolated candidates
+
+All `read_write` Worker rounds execute in a detached temporary Git worktree.
+Scope checks, budgets, verification, and evidence references use that worktree.
+On macOS, both the Worker and every verification shell (including descendants)
+run under the same `sandbox-exec` write policy: only the candidate worktree,
+and the task's Pi session directory are writable. Write delegation fails closed when that backend is
+unavailable; ambient environment variables cannot disable it.
+Successful changes are exported with `git diff --binary` to
+`.subagent-exec/candidates/<task_id>.patch`; the temporary worktree is removed
+and the main working tree remains untouched. Terminal failures are discarded;
+a repairable Checkpoint retains its candidate worktree.
+Binary changes require the explicit `allow_binary_changes: true` policy because
+they cannot be bounded by line count. Escaping symlinks are rejected before a
+candidate artifact is exported.
+
+After review, the coordinator runs `subagent-exec --accept-candidate <task_id>`.
+It first atomically renames the pending artifact to
+`<task_id>.accepted.patch`, then performs `git apply --check` and applies that
+stable artifact, preventing double application. A failed check or apply moves
+the artifact back to pending. Conflicts return
+`CANDIDATE_APPLY_FAILED` without applying a partial patch.
+The coordinator may instead run `--reject-candidate <task_id>`, which renames
+the artifact to `.rejected.patch` without touching the checkout. Non-empty
+candidates become ready only when every acceptance criterion has reproducible
+`passed` evidence. Scope and budgets are recomputed after verification so
+verification side effects cannot enter an unchecked patch.
 
 ---
 

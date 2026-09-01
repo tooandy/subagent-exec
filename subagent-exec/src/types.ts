@@ -49,6 +49,7 @@ export interface ExecutionPolicy {
   risk: RiskLevel;
   max_changed_files?: number;
   max_diff_lines?: number;
+  allow_binary_changes?: boolean;
   estimated_direct_cost_usd?: number;
   max_cost_ratio?: number;
   on_failure: "return_to_coordinator";
@@ -172,6 +173,7 @@ export interface SessionMetadata {
     reason?: "scope_violation" | "budget_exceeded" | "repeated_failure" | "no_new_diagnostics" | "coordinator_required" | "iteration_limit";
     failure_class?: string;
   };
+  candidate_worktree?: string;
 
   /**
    * Working directory captured at start. Continuation invocations
@@ -353,6 +355,11 @@ export interface WorkerResult {
     state: "checkpoint_review" | "repairable_failure" | "coordinator_required" | "terminal_success";
     reason?: "scope_violation" | "budget_exceeded" | "repeated_failure" | "no_new_diagnostics" | "coordinator_required" | "iteration_limit";
     failure_class?: string;
+  };
+
+  candidate?: {
+    status: "pending" | "ready" | "discarded";
+    patch_path?: string;
   };
 
   usage?: UsageInfo;

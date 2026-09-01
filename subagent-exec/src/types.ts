@@ -17,8 +17,12 @@ export type TaskStatus =
   | "needs_continuation";
 
 export interface TaskModel {
-  provider?: string;
-  model?: string;
+  provider: string;
+  model: string;
+  quota_fallback: {
+    provider: string;
+    model: string;
+  } | null;
 }
 
 export interface VerificationConfig {

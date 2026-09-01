@@ -1,18 +1,24 @@
 import { test, describe } from "node:test";
 import assert from "node:assert";
 
-import { parseTask, buildWorkerPrompt } from "../src/task.js";
+import { parseTask as parseTaskContract, buildWorkerPrompt } from "../src/task.js";
+
+const defaultModel = { provider: "minimax-cn", model: "MiniMax-M2.7", quota_fallback: { provider: "deepseek", model: "deepseek-v4-flash" } };
+function parseTask(value: Record<string, unknown>) {
+  return parseTaskContract({ model: defaultModel, ...value });
+}
 
 // =============================================================================
 // parseTask
 // =============================================================================
 
 describe("parseTask", () => {
-  test("parses minimal valid task", () => {
+  test("parses minimal bounded task with an explicit model", () => {
     const input = {
       schema_version: "1.0",
       task_id: "TASK-001",
-      prompt: "Fix the bug in src/auth.ts"
+      prompt: "Fix the bug in src/auth.ts",
+      model: defaultModel
     };
 
     const task = parseTask(input);
@@ -25,6 +31,12 @@ describe("parseTask", () => {
     assert.deepStrictEqual(task.allowed_paths, undefined);
     assert.strictEqual(task.cwd, undefined);
     assert.strictEqual(task.timeout_ms, undefined);
+  });
+
+  test("rejects a task without an explicit provider and model", () => {
+    assert.throws(() => parseTaskContract({ schema_version: "1.0", task_id: "TASK-001", prompt: "x" }), /model/);
+    assert.throws(() => parseTaskContract({ schema_version: "1.0", task_id: "TASK-001", prompt: "x", model: { provider: "minimax-cn" } }), /model/);
+    assert.throws(() => parseTaskContract({ schema_version: "1.0", task_id: "TASK-001", prompt: "x", model: { provider: "minimax-cn", model: "MiniMax-M2.7" } }), /quota_fallback/);
   });
 
   test("parses full task with all optional fields", () => {
@@ -42,7 +54,7 @@ describe("parseTask", () => {
         commands: ["npm test"],
         timeout_ms: 60000
       },
-      model: { provider: "deepseek", model: "deepseek-chat" },
+      model: { provider: "deepseek", model: "deepseek-chat", quota_fallback: null },
       timeout_ms: 900000,
       metadata: { parent: "codex" }
     };
@@ -56,7 +68,7 @@ describe("parseTask", () => {
     assert.deepStrictEqual(task.constraints, ["No new dependencies"]);
     assert.deepStrictEqual(task.acceptance_criteria, ["PKCE implemented", "Tests added"]);
     assert.deepStrictEqual(task.verification?.commands, ["npm test"]);
-    assert.deepStrictEqual(task.model, { provider: "deepseek", model: "deepseek-chat" });
+    assert.deepStrictEqual(task.model, { provider: "deepseek", model: "deepseek-chat", quota_fallback: null });
     assert.strictEqual(task.timeout_ms, 900000);
   });
 

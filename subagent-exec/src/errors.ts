@@ -2,6 +2,7 @@ import type {
   ErrorCategory,
   WorkerError
 } from "./types.js";
+import { isQuotaMessage } from "./model-policy.js";
 
 export class ClassifiedError extends Error {
   constructor(
@@ -78,12 +79,7 @@ export function classifyError(
     );
   }
 
-  if (
-    lower.includes("429") ||
-    lower.includes("rate limit") ||
-    lower.includes("quota") ||
-    lower.includes("too many requests")
-  ) {
+  if (isQuotaMessage(lower)) {
     return createError(
       "quota",
       "PROVIDER_QUOTA_EXCEEDED",

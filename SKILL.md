@@ -154,6 +154,14 @@ Example:
   "schema_version": "1.0",
   "task_id": "RPC-042",
   "cwd": "/workspace/project",
+  "model": {
+    "provider": "minimax-cn",
+    "model": "MiniMax-M2.7",
+    "quota_fallback": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash"
+    }
+  },
   "prompt": "Fix the RPC lifecycle race described below...",
   "timeout_ms": 300000,
   "allowed_paths": [
@@ -176,6 +184,13 @@ Example:
 ```
 
 See `CONTRACT.md` for the complete Task Contract.
+
+Every task must explicitly include the model policy above. A new task always
+tries Minimax first. The runtime may restart once on DeepSeek only for a
+confirmed quota/rate-limit rejection before changes exist. Never request model
+fallback for authentication, sandbox, protocol, verification, or code errors.
+Once a task falls back, its continuations remain on DeepSeek; later new tasks
+try Minimax again.
 
 ## Task Prompt Requirements
 
@@ -247,6 +262,12 @@ Example:
 ```bash
 subagent-exec --task /tmp/task-RPC-042.json
 ```
+
+Before the first delegated task in a workspace, run `subagent-exec --doctor`.
+For implementation rounds, Codex must obtain permission to write Git worktree
+metadata under `.git/worktrees`. A Checkpoint planning round does not require
+that Git metadata write; permission is needed only when implementation begins.
+If doctor fails, do not create a task session or retry blindly.
 
 ## Output Contract
 

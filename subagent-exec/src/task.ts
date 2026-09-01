@@ -5,7 +5,7 @@ import type { Task, ContinueTask } from "./types.js";
 /**
  * Zod schema for Task Contract validation.
  *
- * Required fields: schema_version, task_id, prompt
+ * Required fields: schema_version, task_id, prompt, model
  * Optional fields: objective, cwd, scope, allowed_paths, constraints,
  *                  acceptance_criteria, verification, iteration, model,
  *                  timeout_ms, metadata
@@ -84,10 +84,14 @@ const TaskSchema = z.object({
 
   model: z
     .object({
-      provider: z.string().min(1).optional(),
-      model: z.string().min(1).optional()
+      provider: z.string().min(1),
+      model: z.string().min(1),
+      quota_fallback: z.object({
+        provider: z.string().min(1),
+        model: z.string().min(1)
+      }).nullable()
     })
-    .optional(),
+    .strict(),
 
   timeout_ms: z
     .number()

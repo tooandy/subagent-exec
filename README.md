@@ -75,8 +75,15 @@ Verify:
 
 ```bash
 pi --version
+subagent-exec --doctor
 subagent-exec --task examples/task.json
 ```
+
+Every task explicitly selects a Worker model. The standard policy uses
+`minimax-cn/MiniMax-M2.7` and permits one quota-only fallback to
+`deepseek/deepseek-v4-flash`. Each new task tries Minimax first, so service
+automatically returns to Minimax after its quota recovers; a task already
+running on DeepSeek keeps that model for exact-session continuations.
 
 Continue an existing task:
 
@@ -117,7 +124,8 @@ unchanged diagnostics. Optional direct-cost estimates and ratios provide a
 worker-cost circuit. Successful and terminal metadata is archived under
 `.subagent-exec/archive`; only actionable sessions stay active.
 
-Write-capable Workers run in disposable detached Git worktrees. A successful
+Implementation Workers run in disposable detached Git worktrees. Checkpoint
+planning is read-only and delays worktree creation until continuation. A successful
 Result points to a candidate patch; the main checkout changes only after the
 coordinator explicitly accepts it. Failed candidates are discarded.
 

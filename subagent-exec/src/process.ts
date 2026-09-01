@@ -31,7 +31,7 @@ export interface SpawnOptions {
 
   /** Exact id used when creating a fresh Pi session. */
   sessionId?: string;
-  containmentRoot?: string;
+  containmentWritablePaths?: string[];
 }
 
 export function spawnPi(
@@ -42,8 +42,8 @@ export function spawnPi(
 
   let executable = "pi";
   let spawnArgs = args;
-  if (options.containmentRoot) {
-    const sandboxed = sandboxedCommand("pi", args, [task.cwd, options.sessionDir]);
+  if (options.containmentWritablePaths) {
+    const sandboxed = sandboxedCommand("pi", args, options.containmentWritablePaths);
     executable = sandboxed.executable;
     spawnArgs = sandboxed.args;
   }

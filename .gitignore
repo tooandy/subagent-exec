@@ -7,3 +7,4 @@ subagent-exec/dist/
 .env
 .env.local
 .subagent-exec/
+subagent-exec/.test-fixtures/

@@ -19,6 +19,7 @@ The Task Contract is supplied to `subagent-exec` either as a JSON file
 | `schema_version` | string `"1.0"` | Contract version. |
 | `task_id` | string | Unique task identifier. Matches `^[A-Za-z0-9._:-]+$`, max 200 chars. |
 | `prompt` | string | Self-contained instruction sent to the worker. When `constraints` or `acceptance_criteria` are present they are appended as named sections so the worker receives them as structured data. |
+| `model` | object | Explicit Worker model. The standard primary is `{ provider: "minimax-cn", model: "MiniMax-M2.7" }`; `quota_fallback` may specify `deepseek/deepseek-v4-flash`. |
 
 ### Optional fields
 
@@ -34,7 +35,6 @@ The Task Contract is supplied to `subagent-exec` either as a JSON file
 | `verification` | object | — | Commands to run after worker completes (see below). |
 | `iteration` | object | `{ max_iterations: 2 }` | Bounded session rounds. `max_iterations` is 1–3 and includes the first round. |
 | `execution_policy` | object | — | Required delegation mode, risk, failure behavior, and implementation change budgets. |
-| `model` | object | — | `{ provider, model }` forwarded to worker runtime. |
 | `timeout_ms` | number | 900000 | Max execution time in ms. Max 24h (86400000). |
 | `metadata` | object | — | Free-form data passed through to the Result. |
 
@@ -85,6 +85,20 @@ overwrite constraints by editing the prompt.
 | `max_cost_ratio` | number | Optional worker/direct cost ceiling in `(0,1]`; paired with the estimate. |
 | `on_failure` | enum | V1 requires `return_to_coordinator`. |
 
+### model sub-object
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `provider` | string | Required primary provider; standard value `minimax-cn`. |
+| `model` | string | Required primary model; standard value `MiniMax-M2.7`. |
+| `quota_fallback` | object or `null` | Required explicit policy. Standard value `{ provider: "deepseek", model: "deepseek-v4-flash" }`; use `null` only for an internally restarted fallback session. |
+
+`subagent-exec --doctor` checks the configured primary and fallback models,
+the macOS containment backend, and Git worktree metadata permission without
+creating task/session/outcome state. The runtime also performs the applicable
+checks automatically before starting a new task; Checkpoint planning defers
+the Git metadata check until implementation continuation.
+
 Admission rules:
 
 - Fast requires `scope=read_write`, low risk, one iteration, allowed paths,
@@ -95,6 +109,12 @@ Admission rules:
 - Investigation requires `scope=read_only`, high risk, and one iteration.
 - Missing or inconsistent boundaries return `DELEGATION_NOT_RECOMMENDED`
   before Pi is spawned.
+- Every new task explicitly names its provider and model. The standard policy
+  starts with `minimax-cn/MiniMax-M2.7` and permits one fresh-session fallback
+  to `deepseek/deepseek-v4-flash` only when the first Prompt is rejected for
+  quota/rate-limit reasons. Authentication, sandbox, protocol, and ordinary
+  execution failures never trigger fallback. A fallback task keeps DeepSeek
+  for all continuations; each new task starts with Minimax again.
 - Prompts are capped at 12,000 characters. Implementation path patterns must
   be repository-relative and may not select the whole repository (`*`, `**`,
   `**/*`, absolute paths, and parent traversal are rejected). The coordinator
@@ -144,6 +164,11 @@ Runtime state is stored under `<cwd>/.subagent-exec/`: contract metadata in
   "objective": "Add OAuth support",
   "prompt": "Implement OAuth 2.0 PKCE flow in src/auth/oauth.ts...",
   "cwd": "/workspace/project",
+  "model": {
+    "provider": "minimax-cn",
+    "model": "MiniMax-M2.7",
+    "quota_fallback": { "provider": "deepseek", "model": "deepseek-v4-flash" }
+  },
   "allowed_paths": ["src/auth/**", "tests/auth/**"],
   "iteration": { "max_iterations": 1 },
   "execution_policy": {
@@ -170,6 +195,11 @@ Runtime state is stored under `<cwd>/.subagent-exec/`: contract metadata in
   "objective": "Review RPC lifecycle implementation",
   "prompt": "Review src/rpc.ts and src/cli.ts for race conditions...",
   "cwd": "/workspace/project",
+  "model": {
+    "provider": "minimax-cn",
+    "model": "MiniMax-M2.7",
+    "quota_fallback": { "provider": "deepseek", "model": "deepseek-v4-flash" }
+  },
   "scope": "read_only",
   "iteration": { "max_iterations": 1 },
   "execution_policy": {
@@ -414,7 +444,9 @@ the other stop rule governs that round.
 
 ### isolated candidates
 
-All `read_write` Worker rounds execute in a detached temporary Git worktree.
+All implementation Worker rounds execute in a detached temporary Git worktree.
+The first Checkpoint planning round is OS-contained read-only in the main
+checkout and delays worktree creation until coordinator-approved continuation.
 Scope checks, budgets, verification, and evidence references use that worktree.
 On macOS, both the Worker and every verification shell (including descendants)
 run under the same `sandbox-exec` write policy: only the candidate worktree,

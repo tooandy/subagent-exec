@@ -87,6 +87,8 @@ import {
 import { canContinueSession, diagnosticFingerprint, evaluateResultCircuit, failureClass } from "./circuit.js";
 import { acceptCandidate, candidateBaseHead, createCandidateWorktree, discardCandidate, exportCandidatePatch, rejectCandidate } from "./candidate.js";
 import { assessOutcome, fingerprintFiles, outcomeCandidateManifest, recordCoordinatorDecision, recordIteration, recordPersistenceFailure, validateOutcomeTaskId } from "./outcome.js";
+import { DEFAULT_QUOTA_FALLBACK_MODEL, DEFAULT_WORKER_MODEL, isQuotaMessage } from "./model-policy.js";
+import { runDoctor } from "./doctor.js";
 
 import type {
   ExecutionInfo,
@@ -220,6 +222,7 @@ OPTIONS
                      Reject a candidate patch without changing the workspace.
   --assess-outcome <id>
                      Compare accepted files with their acceptance fingerprints.
+  --doctor           Preflight Pi models, containment, and Git worktree permission.
   --feedback <path>  Load Continue Task feedback JSON from a file.
   --task-id <id>     Override task_id validation.
   --help, -h         Print this usage message and exit.
@@ -543,6 +546,15 @@ process.on("SIGTERM", () => handleSignal("SIGTERM"));
 function classifyStderrLine(line: string): WorkerError | null {
   const lower = line.toLowerCase();
 
+  if (lower.includes("operation not permitted") || lower.includes("permission denied") || lower.includes("eacces")) {
+    return createError(
+      "scope",
+      "WRITE_CONTAINMENT_VIOLATION",
+      `Worker write was blocked by containment: ${line.slice(0, 200)}`,
+      { retryable: false }
+    );
+  }
+
   if (
     lower.includes("401") ||
     lower.includes("403") ||
@@ -561,14 +573,7 @@ function classifyStderrLine(line: string): WorkerError | null {
     );
   }
 
-  if (
-    lower.includes("429") ||
-    lower.includes("rate limit") ||
-    lower.includes("quota") ||
-    lower.includes("too many requests") ||
-    lower.includes("exceeded quota") ||
-    lower.includes("monthly limit")
-  ) {
+  if (isQuotaMessage(lower) || lower.includes("monthly limit")) {
     return createError(
       "quota",
       "PROVIDER_QUOTA_EXCEEDED",
@@ -612,6 +617,12 @@ function classifyStderrLine(line: string): WorkerError | null {
 }
 
 async function main(): Promise<void> {
+  if (hasArg("--doctor")) {
+    const result = await runDoctor(process.cwd());
+    printResult(result);
+    process.exitCode = result.status === "passed" ? 0 : 1;
+    return;
+  }
   const assessTaskId = getArg("--assess-outcome");
   if (assessTaskId) {
     let release: (() => Promise<void>) | null = null;
@@ -894,7 +905,13 @@ async function main(): Promise<void> {
       verification: metadata.original_task.verification,
       iteration: metadata.original_task.iteration,
       execution_policy: metadata.original_task.execution_policy,
-      model: metadata.original_task.model,
+      model: metadata.original_task.model
+        ? {
+            provider: metadata.original_task.model.provider ?? DEFAULT_WORKER_MODEL.provider,
+            model: metadata.original_task.model.model ?? DEFAULT_WORKER_MODEL.model,
+            quota_fallback: metadata.original_task.model.quota_fallback ?? null
+          }
+        : { ...DEFAULT_WORKER_MODEL, quota_fallback: DEFAULT_QUOTA_FALLBACK_MODEL },
       timeout_ms:
         continueTask.timeout_ms ??
         metadata.original_task.timeout_ms,
@@ -970,7 +987,8 @@ async function main(): Promise<void> {
 
 async function runIteration(
   rawTask: unknown,
-  existingSession: SessionMetadata | undefined
+  existingSession: SessionMetadata | undefined,
+  fallbackAttempted = false
 ): Promise<void> {
   /*
    * 1. Parse task.
@@ -1055,7 +1073,29 @@ async function runIteration(
       ? existingSession.iteration + 1
       : 1;
   const checkpointPlanning = isCheckpointPlanningRound(task, iterationNumber);
-  const isolatedWrite = task.scope === "read_write";
+  const needsCandidateWorktree = task.scope === "read_write" && !checkpointPlanning && !existingSession?.candidate_worktree;
+  if (!existingSession || needsCandidateWorktree) {
+    const requestedModels = [
+      { name: "primary_model", provider: task.model!.provider, model: task.model!.model },
+      ...(task.model!.quota_fallback ? [{ name: "quota_fallback_model", ...task.model!.quota_fallback }] : [])
+    ];
+    const preflight = await runDoctor(cwd, {
+      requireGitMetadata: needsCandidateWorktree,
+      models: requestedModels
+    });
+    if (preflight.status === "failed") {
+      printResult(createFailedResult(task.task_id, createError(
+        "runtime", "PREFLIGHT_FAILED", "Worker preflight failed before session creation",
+        { retryable: false, details: preflight.checks.filter(check => check.status === "failed") }
+      ), new Date(), null, task.acceptance_criteria));
+      process.exitCode = 1;
+      return;
+    }
+  }
+  // A checkpoint planning round is read-only and must not mutate `.git` just
+  // to prepare a candidate. Its candidate worktree is created only after the
+  // coordinator authorizes implementation on the continuation round.
+  const isolatedWrite = task.scope === "read_write" && !checkpointPlanning;
   let executionCwd = cwd;
   if (isolatedWrite) {
     try {
@@ -1122,7 +1162,9 @@ async function runIteration(
         continueFrom: existingSession,
         sessionDir: existingSession?.worker_session_dir ?? resolvePiSessionDir(cwd),
         sessionId: session.worker_session_id,
-        containmentRoot: isolatedWrite ? cwd : undefined
+        containmentWritablePaths: task.scope === "read_write"
+          ? [executionCwd === cwd ? undefined : executionCwd, existingSession?.worker_session_dir ?? resolvePiSessionDir(cwd)].filter((path): path is string => Boolean(path))
+          : undefined
       }
     );
     rpc = new PiRpcClient(pi.child);
@@ -1168,6 +1210,10 @@ async function runIteration(
     );
 
     updateRpcState(state, event);
+
+    if (event.type === "pi_stderr" && typeof event.line === "string" && !workerError) {
+      workerError = classifyStderrLine(event.line);
+    }
 
     /*
      * Classify protocol_error events.
@@ -1291,16 +1337,42 @@ async function runIteration(
     ]);
 
     if (!response.success) {
-      throw protocolError(
-        "PROMPT_REJECTED",
-        response.error ?? "Pi rejected prompt"
-      );
+      const message = response.error ?? "Pi rejected prompt";
+      const classified = classifyError(new Error(message), "protocol");
+      if (classified.category !== "protocol") {
+        throw new ClassifiedError(classified.category, classified.code, classified.message, classified.retryable, classified.details);
+      }
+      throw protocolError("PROMPT_REJECTED", message);
     }
 
     logger.log("prompt_accepted");
   } catch (error) {
     removeRpcListener();
     cleanupRace();
+
+    const rejectionMessage = error instanceof Error ? error.message : String(error);
+    const primaryModel = task.model;
+    const fallback = primaryModel?.quota_fallback;
+    if (!existingSession && !fallbackAttempted && primaryModel && fallback && isQuotaMessage(rejectionMessage)) {
+      await shutdownPi(pi, rpc, logger);
+      if (session.candidate_worktree) {
+        try { await discardCandidate(cwd, session.candidate_worktree); }
+        catch (cleanupError) {
+          workerError = createError("runtime", "CANDIDATE_CLEANUP_FAILED",
+            `Cannot safely start quota fallback: ${String(cleanupError)}`, { retryable: false });
+        }
+      }
+      if (!workerError) {
+        logger.log("provider_quota_fallback", {
+          from_provider: primaryModel.provider,
+          from_model: primaryModel.model,
+          to_provider: fallback.provider,
+          to_model: fallback.model
+        });
+        await runIteration({ ...task, model: { provider: fallback.provider, model: fallback.model, quota_fallback: null } }, undefined, true);
+        return;
+      }
+    }
 
     if (error instanceof TimeoutError) {
       timeoutTriggered = true;
@@ -1318,15 +1390,15 @@ async function runIteration(
         { retryable: false }
       );
     } else {
-      workerError =
+      workerError ??=
         error instanceof ClassifiedError
-        ? createError(
-            error.category,
-            error.code,
-            error.message,
-            { retryable: error.retryable }
-          )
-        : classifyError(error);
+          ? createError(
+              error.category,
+              error.code,
+              error.message,
+              { retryable: error.retryable }
+            )
+          : classifyError(error);
     }
 
     await shutdownPi(pi, rpc, logger);

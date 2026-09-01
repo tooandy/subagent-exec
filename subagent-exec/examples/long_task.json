@@ -9,6 +9,12 @@
 
   "cwd": ".",
 
+  "model": {
+    "provider": "minimax-cn",
+    "model": "MiniMax-M2.7",
+    "quota_fallback": { "provider": "deepseek", "model": "deepseek-v4-flash" }
+  },
+
   "scope": "read_only",
 
   "iteration": { "max_iterations": 1 },

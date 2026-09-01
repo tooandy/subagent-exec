@@ -26,9 +26,12 @@ async function fixture(mode = "success") {
   const pi = join(bin, "pi");
   await writeFile(pi, `#!/usr/bin/env node
 const fs = require("node:fs");
-const contained = process.cwd().includes("subagent-candidate-");
-const argsLog = contained ? process.env.PI_CONTAINED_ARGS_LOG : process.env.PI_ARGS_LOG;
-const promptsLog = contained ? process.env.PI_CONTAINED_PROMPTS_LOG : process.env.PI_PROMPTS_LOG;
+if (process.argv.includes("--version")) { process.stdout.write("0.84.3\\n"); process.exit(0); }
+if (process.argv.includes("--list-models")) {
+  process.stdout.write("provider model\\nminimax-cn MiniMax-M2.7\\n" + (process.env.PI_MISSING_FALLBACK ? "" : "deepseek deepseek-v4-flash\\n")); process.exit(0);
+}
+const argsLog = process.env.PI_CONTAINED_ARGS_LOG;
+const promptsLog = process.env.PI_CONTAINED_PROMPTS_LOG;
 fs.appendFileSync(argsLog, JSON.stringify(process.argv.slice(2)) + "\\n");
 let buffer = "";
 process.stdin.on("data", (chunk) => {
@@ -41,6 +44,16 @@ process.stdin.on("data", (chunk) => {
     if (command.type === "prompt") {
       const answer = process.env.PI_MESSAGE || "done";
       fs.appendFileSync(promptsLog, command.message + "\\n---PROMPT---\\n");
+      const argv = process.argv.slice(2);
+      const providerIndex = argv.indexOf("--provider");
+      if (process.env.PI_QUOTA_PRIMARY && argv[providerIndex + 1] === "minimax-cn") {
+        process.stdout.write(JSON.stringify({type:"response",id:command.id,success:false,error:"429 quota exceeded"})+"\\n");
+        continue;
+      }
+      if (process.env.PI_AUTH_PRIMARY && argv[providerIndex + 1] === "minimax-cn") {
+        process.stdout.write(JSON.stringify({type:"response",id:command.id,success:false,error:"401 invalid api key"})+"\\n");
+        continue;
+      }
       if (process.env.PI_TOUCH) fs.writeFileSync(require("node:path").basename(process.env.PI_TOUCH), "one\\ntwo\\n");
       if (process.env.PI_TOUCH_SECOND) fs.writeFileSync(require("node:path").basename(process.env.PI_TOUCH_SECOND), "three\\n");
       if (process.env.PI_ESCAPE) fs.writeFileSync(process.env.PI_ESCAPE, "escaped");
@@ -82,7 +95,8 @@ process.stdin.on("data", (chunk) => {
   execFileSync("git", ["config", "user.name", "Test"], { cwd: dir });
   await writeFile(join(dir, "tracked.txt"), "base", "utf8");
   await writeFile(join(dir, "multi.txt"), Array.from({ length: 20 }, (_, index) => `line-${index + 1}`).join("\n") + "\n", "utf8");
-  execFileSync("git", ["add", "tracked.txt", "multi.txt"], { cwd: dir });
+  await writeFile(join(dir, ".gitignore"), ".subagent-exec/\n", "utf8");
+  execFileSync("git", ["add", "tracked.txt", "multi.txt", ".gitignore"], { cwd: dir });
   execFileSync("git", ["commit", "-qm", "init"], { cwd: dir });
   return {
     dir,
@@ -103,6 +117,10 @@ process.stdin.on("data", (chunk) => {
 function runCli(cwd: string, env: NodeJS.ProcessEnv, args: string[], input?: string) {
   if (input !== undefined) {
     const parsed = JSON.parse(input);
+    if (parsed.action !== "continue") parsed.model ??= {
+      provider: "minimax-cn", model: "MiniMax-M2.7",
+      quota_fallback: { provider: "deepseek", model: "deepseek-v4-flash" }
+    };
     if (parsed.action !== "continue" && !parsed.execution_policy) {
       if (parsed.scope === "read_only") {
         parsed.iteration = { max_iterations: 1 };
@@ -122,8 +140,8 @@ function runCli(cwd: string, env: NodeJS.ProcessEnv, args: string[], input?: str
           on_failure: "return_to_coordinator"
         };
       }
-      input = JSON.stringify(parsed);
     }
+    input = JSON.stringify(parsed);
   }
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolvePromise) => {
     const child = spawn(process.execPath, [cli, ...args], { cwd, env, stdio: "pipe" });
@@ -136,6 +154,96 @@ function runCli(cwd: string, env: NodeJS.ProcessEnv, args: string[], input?: str
 }
 
 describe("continuation CLI integration", () => {
+  test("doctor validates both models, containment, and Git metadata permission without task state", async () => {
+    const f = await fixture();
+    try {
+      const before = await readFile(f.argsLog, "utf8");
+      const checked = await runCli(f.dir, f.env, ["--doctor"]);
+      assert.equal(checked.code, 0, checked.stdout);
+      const result = JSON.parse(checked.stdout);
+      assert.equal(result.status, "passed");
+      assert.deepEqual(result.primary_model, { provider: "minimax-cn", model: "MiniMax-M2.7" });
+      assert.deepEqual(result.quota_fallback_model, { provider: "deepseek", model: "deepseek-v4-flash" });
+      assert.ok(result.checks.every((check: { status: string }) => check.status === "passed"));
+      assert.equal(await readFile(f.argsLog, "utf8"), before);
+    } finally { await f.cleanup(); }
+  });
+
+  test("preflight rejects an unavailable fallback model before creating task state", async () => {
+    const f = await fixture();
+    try {
+      const checked = await runCli(f.dir, { ...f.env, PI_MISSING_FALLBACK: "1" }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "PREFLIGHT-MODEL", prompt: "inspect", cwd: f.dir, scope: "read_only",
+        iteration: { max_iterations: 1 }, execution_policy: { mode: "investigation", risk: "high", on_failure: "return_to_coordinator" }
+      }));
+      assert.equal(checked.code, 1);
+      const result = JSON.parse(checked.stdout);
+      assert.equal(result.error.code, "PREFLIGHT_FAILED");
+      assert.match(JSON.stringify(result.error.details), /deepseek-v4-flash/);
+      await assert.rejects(() => readFile(join(f.dir, ".subagent-exec", "metadata", "PREFLIGHT-MODEL.json"), "utf8"));
+      assert.equal(await readFile(f.argsLog, "utf8"), "");
+    } finally { await f.cleanup(); }
+  });
+
+  test("falls back from Minimax to DeepSeek once on primary quota exhaustion", async () => {
+    const f = await fixture();
+    try {
+      const result = await runCli(f.dir, { ...f.env, PI_QUOTA_PRIMARY: "1" }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "MODEL-FALLBACK", prompt: "inspect", cwd: f.dir, scope: "read_only",
+        iteration: { max_iterations: 1 }, execution_policy: { mode: "investigation", risk: "high", on_failure: "return_to_coordinator" }
+      }));
+      assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+      const parsed = JSON.parse(result.stdout);
+      assert.equal(parsed.worker.provider, "deepseek");
+      assert.equal(parsed.worker.model, "deepseek-v4-flash");
+      const invocations = (await readFile(f.argsLog, "utf8")).trim().split("\n").map(JSON.parse);
+      assert.equal(invocations.length, 2);
+      assert.deepEqual(invocations.map(args => args[args.indexOf("--provider") + 1]), ["minimax-cn", "deepseek"]);
+
+      const recovered = await runCli(f.dir, f.env, [], JSON.stringify({
+        schema_version: "1.0", task_id: "MODEL-RECOVERED", prompt: "inspect", cwd: f.dir, scope: "read_only",
+        iteration: { max_iterations: 1 }, execution_policy: { mode: "investigation", risk: "high", on_failure: "return_to_coordinator" }
+      }));
+      assert.equal(JSON.parse(recovered.stdout).worker.provider, "minimax-cn");
+    } finally { await f.cleanup(); }
+  });
+
+  test("keeps the fallback model for exact-session checkpoint continuation", async () => {
+    const f = await fixture();
+    try {
+      const first = await runCli(f.dir, { ...f.env, PI_QUOTA_PRIMARY: "1" }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "MODEL-CONTINUE", prompt: "plan", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["done"], verification: { commands: ["true"] },
+        iteration: { max_iterations: 2 }, execution_policy: { mode: "checkpoint", risk: "medium", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }));
+      assert.equal(JSON.parse(first.stdout).worker.provider, "deepseek");
+      const second = await runCli(f.dir, { ...f.env, PI_QUOTA_PRIMARY: "1" }, ["--continue", "MODEL-CONTINUE"], JSON.stringify({
+        schema_version: "1.0", task_id: "MODEL-CONTINUE", action: "continue", feedback: "implement"
+      }));
+      assert.equal(second.code, 0, second.stdout);
+      assert.equal(JSON.parse(second.stdout).worker.provider, "deepseek");
+      const providers = (await readFile(f.argsLog, "utf8")).trim().split("\n").map(JSON.parse)
+        .map(args => args[args.indexOf("--provider") + 1]);
+      assert.deepEqual(providers, ["minimax-cn", "deepseek", "deepseek"]);
+    } finally { await f.cleanup(); }
+  });
+
+  test("does not use the quota fallback for authentication failures", async () => {
+    const f = await fixture();
+    try {
+      const result = await runCli(f.dir, { ...f.env, PI_AUTH_PRIMARY: "1" }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "MODEL-AUTH", prompt: "inspect", cwd: f.dir, scope: "read_only",
+        iteration: { max_iterations: 1 }, execution_policy: { mode: "investigation", risk: "high", on_failure: "return_to_coordinator" }
+      }));
+      assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+      const parsed = JSON.parse(result.stdout);
+      assert.equal(parsed.error.category, "auth");
+      assert.equal(parsed.error.code, "AUTH_ERROR");
+      const invocations = (await readFile(f.argsLog, "utf8")).trim().split("\n");
+      assert.equal(invocations.length, 1);
+    } finally { await f.cleanup(); }
+  });
+
   test("rejects inadmissible delegation before spawning Pi", async () => {
     const f = await fixture();
     try {
@@ -292,6 +400,7 @@ describe("continuation CLI integration", () => {
       let stdout = ""; child.stdout.on("data", (chunk) => { stdout += chunk; });
       child.stdin.end(JSON.stringify({
         schema_version: "1.0", task_id: "CANCEL", prompt: "x", cwd: hanging.dir, timeout_ms: 5000,
+        model: { provider: "minimax-cn", model: "MiniMax-M2.7", quota_fallback: { provider: "deepseek", model: "deepseek-v4-flash" } },
         scope: "read_write", allowed_paths: ["*.txt"], acceptance_criteria: ["done"],
         verification: { commands: ["false"] }, iteration: { max_iterations: 1 },
         execution_policy: { mode: "fast", risk: "low", max_changed_files: 10, max_diff_lines: 100, on_failure: "return_to_coordinator" }
@@ -423,7 +532,7 @@ describe("continuation CLI integration", () => {
         execution_policy: { mode: "checkpoint", risk: "medium", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
       };
       const failed = await runCli(f.dir, { ...f.env, PI_TOUCH: join(f.dir, "tracked.txt") }, [], JSON.stringify(task));
-      assert.equal(JSON.parse(failed.stdout).error.code, "READ_ONLY_SCOPE_VIOLATION");
+      assert.equal(JSON.parse(failed.stdout).error.code, "WRITE_CONTAINMENT_VIOLATION", `${failed.stdout}\n${failed.stderr}`);
       const continued = await runCli(f.dir, f.env, ["--continue", "FAILED-PLAN"], JSON.stringify({
         schema_version: "1.0", task_id: "FAILED-PLAN", action: "continue", feedback: "continue anyway"
       }));

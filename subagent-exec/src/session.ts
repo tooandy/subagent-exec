@@ -83,7 +83,11 @@ const SessionMetadataSchema = z.object({
     }).optional(),
     model: z.object({
       provider: z.string().optional(),
-      model: z.string().optional()
+      model: z.string().optional(),
+      quota_fallback: z.object({
+        provider: z.string().min(1),
+        model: z.string().min(1)
+      }).nullable().optional()
     }).optional(),
     timeout_ms: z.number().int().positive().optional(),
     metadata: z.record(z.string(), z.unknown()).optional()

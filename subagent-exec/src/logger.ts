@@ -4,6 +4,7 @@ export type LogEventName =
   | "prompt_sent"
   | "prompt_accepted"
   | "prompt_rejected"
+  | "provider_quota_fallback"
   | "agent_start"
   | "agent_end"
   | "agent_settled"

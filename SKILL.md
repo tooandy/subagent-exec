@@ -53,6 +53,11 @@ Codex must:
 6. Inspect important changes when necessary.
 7. Decide whether the task is actually complete.
 
+Before accepting a successful Result, inspect `acceptance_evidence` and verify
+its command, test, file, and symbol references as appropriate. A criterion
+marked `manual_review_required` is not accepted merely because the top-level
+status is `success`.
+
 Workers perform bounded tasks with explicit acceptance criteria.
 
 ## When to Use a Worker

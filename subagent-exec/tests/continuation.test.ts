@@ -26,6 +26,7 @@ process.stdin.on("data", (chunk) => {
     if (!line) continue;
     const command = JSON.parse(line);
     if (command.type === "prompt") {
+      const answer = process.env.PI_MESSAGE || "done";
       fs.appendFileSync(process.env.PI_PROMPTS_LOG, command.message + "\\n---PROMPT---\\n");
       if (process.env.PI_TOUCH) fs.writeFileSync(process.env.PI_TOUCH, "one\\ntwo\\n");
       if (process.env.PI_TOUCH_SECOND) fs.writeFileSync(process.env.PI_TOUCH_SECOND, "three\\n");
@@ -33,8 +34,8 @@ process.stdin.on("data", (chunk) => {
       if (process.env.PI_EXIT_EARLY) process.exit(7);
       if ((process.env.PI_MODE || ${JSON.stringify(mode)}) !== "hang") {
         process.stdout.write(JSON.stringify({type:"agent_start"})+"\\n");
-        process.stdout.write(JSON.stringify({type:"message_end",message:{role:"assistant",content:"done"}})+"\\n");
-        process.stdout.write(JSON.stringify({type:"agent_end",messages:[{role:"assistant",content:"done"}]})+"\\n");
+        process.stdout.write(JSON.stringify({type:"message_end",message:{role:"assistant",content:answer}})+"\\n");
+        process.stdout.write(JSON.stringify({type:"agent_end",messages:[{role:"assistant",content:answer}]})+"\\n");
         process.stdout.write(JSON.stringify({type:"agent_settled"})+"\\n");
       }
     } else if (command.type === "get_session_stats") {
@@ -107,10 +108,14 @@ describe("continuation CLI integration", () => {
     try {
       const result = await runCli(f.dir, f.env, [], JSON.stringify({
         schema_version: "1.0", task_id: "REJECT", prompt: "x", cwd: f.dir,
+        acceptance_criteria: ["must remain visible"],
         execution_policy: { mode: "fast", risk: "high", on_failure: "return_to_coordinator" }
       }));
       assert.equal(result.code, 2);
-      assert.equal(JSON.parse(result.stdout).error.code, "DELEGATION_NOT_RECOMMENDED");
+      const rejected = JSON.parse(result.stdout);
+      assert.equal(rejected.error.code, "DELEGATION_NOT_RECOMMENDED");
+      assert.equal(rejected.acceptance_evidence.criteria[0].criterion, "must remain visible");
+      assert.ok(rejected.acceptance_evidence.recommended_next_action);
       await assert.rejects(() => readFile(f.argsLog, "utf8"));
     } finally { await f.cleanup(); }
   });
@@ -224,6 +229,8 @@ describe("continuation CLI integration", () => {
       }));
       assert.equal(timed.code, 124);
       assert.equal(JSON.parse(timed.stdout).status, "timeout");
+      assert.equal(JSON.parse(timed.stdout).acceptance_evidence.criteria[0].status, "manual_review_required");
+      assert.ok(JSON.parse(timed.stdout).acceptance_evidence.recommended_next_action);
       const timedMetadata = JSON.parse(await readFile(join(hanging.dir, ".subagent-exec", "metadata", "TIME.json"), "utf8"));
       assert.equal(timedMetadata.iteration, 1);
       assert.equal(timedMetadata.last_result.status, "timeout");
@@ -241,6 +248,7 @@ describe("continuation CLI integration", () => {
       const code = await new Promise<number | null>((resolvePromise) => child.on("exit", resolvePromise));
       assert.equal(code, 130);
       assert.equal(JSON.parse(stdout).status, "cancelled");
+      assert.ok(JSON.parse(stdout).acceptance_evidence.recommended_next_action);
       const cancelledMetadata = JSON.parse(await readFile(join(hanging.dir, ".subagent-exec", "metadata", "CANCEL.json"), "utf8"));
       assert.equal(cancelledMetadata.iteration, 1);
       assert.equal(cancelledMetadata.last_result.status, "cancelled");
@@ -288,6 +296,7 @@ describe("continuation CLI integration", () => {
       const parsed = JSON.parse(result.stdout);
       assert.equal(parsed.status, "failed");
       assert.equal(parsed.error.code, "SESSION_PERSISTENCE_FAILED");
+      assert.ok(parsed.acceptance_evidence.recommended_next_action);
     } finally { await f.cleanup(); }
   });
 
@@ -398,6 +407,27 @@ describe("continuation CLI integration", () => {
       }));
       assert.equal(failed.code, 1);
       assert.equal(JSON.parse(failed.stdout).error.code, "READ_ONLY_SCOPE_VIOLATION");
+    } finally { await f.cleanup(); }
+  });
+
+  test("emits normalized structured acceptance evidence", async () => {
+    const f = await fixture();
+    try {
+      const message = `done\n\`\`\`subagent-evidence\n${JSON.stringify({
+        assumptions: ["clean fixture"], decisions: ["minimal change"],
+        criteria: [{ criterion: "tests pass", status: "passed", evidence: [{ type: "command", reference: "true" }] }],
+        changed_symbols: ["fixture"], tests_added: ["integration"], known_risks: [], unresolved_items: [],
+        review_locations: ["tracked.txt:1"], recommended_next_action: "accept"
+      })}\n\`\`\``;
+      const completed = await runCli(f.dir, { ...f.env, PI_MESSAGE: message }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "EVIDENCE", prompt: "report", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["tests pass"],
+        verification: { commands: ["true"] }, iteration: { max_iterations: 1 },
+        execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      }));
+      const evidence = JSON.parse(completed.stdout).acceptance_evidence;
+      assert.equal(evidence.criteria[0].status, "passed");
+      assert.equal(evidence.review_locations[0], "tracked.txt:1");
     } finally { await f.cleanup(); }
   });
 });

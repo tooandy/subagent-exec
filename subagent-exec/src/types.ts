@@ -290,6 +290,26 @@ export interface WorkerError {
   retryable?: boolean;
 }
 
+export interface AcceptanceEvidence {
+  assumptions: string[];
+  decisions: string[];
+  criteria: Array<{
+    criterion: string;
+    status: "passed" | "failed" | "manual_review_required";
+    evidence: Array<{
+      type: "command" | "test" | "file" | "symbol";
+      reference: string;
+      detail?: string;
+    }>;
+  }>;
+  changed_symbols: string[];
+  tests_added: string[];
+  known_risks: string[];
+  unresolved_items: string[];
+  review_locations: string[];
+  recommended_next_action?: string;
+}
+
 export interface WorkerResult {
   schema_version: "1.0";
 
@@ -312,6 +332,8 @@ export interface WorkerResult {
   scope: ScopeInfo;
 
   verification: VerificationResult;
+
+  acceptance_evidence: AcceptanceEvidence;
 
   usage?: UsageInfo;
 

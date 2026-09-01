@@ -128,6 +128,17 @@ Evidence should reference reproducible commands, test names, and file or symbol
 locations. Criteria without machine-verifiable evidence must be marked
 `manual_review_required`, not silently treated as passed.
 
+### Phase 3 exit criteria
+
+- Every Result contains a schema-stable `acceptance_evidence` object.
+- Every requested acceptance criterion appears exactly once; unsupported
+  passed claims require manual review.
+- Evidence identifies commands, tests, files, and symbols with concrete
+  references.
+- Assumptions, decisions, changed symbols, tests, risks, unresolved items,
+  review locations, and a recommended next action survive into the Result.
+- Contract, coordinator guidance, unit tests, and CLI integration tests agree.
+
 ## Phase 4: Rework circuit breaker
 
 Continuation is a bounded repair mechanism, not a default retry loop.

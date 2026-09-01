@@ -12,6 +12,7 @@ import type {
   WorkerResult,
   Task
 } from "./types.js";
+import { extractAcceptanceEvidence } from "./evidence.js";
 
 export interface RpcState {
   settled: boolean;
@@ -208,6 +209,16 @@ export function buildResult(
     status = "success";
   }
 
+  const acceptanceEvidence = extractAcceptanceEvidence(state.assistantMessage, task.acceptance_criteria, {
+    verification,
+    changedFiles: scope.changed_files
+  });
+  if (error && !acceptanceEvidence.recommended_next_action) {
+    acceptanceEvidence.recommended_next_action = error.retryable
+      ? "Return to the coordinator to decide whether to retry with revised instructions."
+      : "Return to the coordinator for manual review and takeover.";
+  }
+
   return {
     schema_version: "1.0",
 
@@ -235,6 +246,8 @@ export function buildResult(
     scope,
 
     verification,
+
+    acceptance_evidence: acceptanceEvidence,
 
     usage: state.usage,
 

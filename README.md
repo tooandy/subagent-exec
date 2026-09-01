@@ -117,6 +117,11 @@ cat examples/task.json | subagent-exec
 
 **stdout**: exactly one strict JSON object (the Result Contract).
 
+Every Result includes normalized `acceptance_evidence`: assumptions,
+decisions, criterion statuses and reproducible references, changed symbols,
+tests, risks, unresolved items, review locations, and a recommended next
+action. Unsupported completion claims are marked `manual_review_required`.
+
 **stderr**: JSONL lifecycle events for observability.
 
 ## Documentation

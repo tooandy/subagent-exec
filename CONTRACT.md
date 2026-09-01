@@ -195,11 +195,31 @@ Runtime state is stored under `<cwd>/.subagent-exec/`: contract metadata in
 | `result` | object | Worker output (summary, final message, changed files). |
 | `scope` | object | Workspace scope verification. |
 | `verification` | object | Verification command results. |
+| `acceptance_evidence` | object | Structured criterion evidence and review guidance. |
 | `usage` | object or null | Token / cost usage (may be null if unavailable). |
 | `iteration` | integer | Current one-based session round. |
 | `needs_continuation` | object | Present when a Checkpoint plan awaits coordinator review. |
 | `error` | object or null | Structured error for failed, cancelled, or timeout results. |
 | `metadata` | object | Echoed from Task Contract. |
+
+### acceptance_evidence
+
+The Worker is instructed to end its response with a fenced
+`subagent-evidence` JSON object. The gateway validates and normalizes it into
+assumptions, decisions, criterion statuses and evidence, changed symbols, tests
+added, risks, unresolved items, review locations, and an optional recommended
+next action. Evidence types are `command`, `test`, `file`, and `symbol`, each
+with a non-empty concrete reference.
+
+The evidence fence must be the final response block. A `command` reference must
+exactly match a successful configured verification command; a `test` reference
+must equal a complete line in successful verification output; a `file` must identify a changed
+file (optionally with a positive integer `:line`); and a `symbol` must use `path#symbol` for a
+changed file. These checks establish reproducibility, not semantic sufficiency.
+
+Missing or malformed evidence, omitted criteria, and `passed` claims without
+evidence are normalized to `manual_review_required`. The overall task may still
+return `success`; the coordinator must inspect this field before acceptance.
 
 ### worker
 

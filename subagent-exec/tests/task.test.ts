@@ -131,6 +131,10 @@ describe("parseTask", () => {
     assert.throws(() => parseTask({ schema_version: "1.0", task_id: "x", prompt: "x".repeat(12_001) }));
   });
 
+  test("rejects duplicate acceptance criteria", () => {
+    assert.throws(() => parseTask({ schema_version: "1.0", task_id: "x", prompt: "x", acceptance_criteria: ["same", "same"] }));
+  });
+
   test("rejects scope not in enum", () => {
     assert.throws(() => {
       parseTask({
@@ -184,9 +188,10 @@ describe("parseTask", () => {
 // =============================================================================
 
 describe("buildWorkerPrompt", () => {
-  test("returns just the prompt when no extras", () => {
+  test("preserves the prompt and appends the evidence contract", () => {
     const result = buildWorkerPrompt("Fix the bug");
-    assert.strictEqual(result, "Fix the bug");
+    assert.ok(result.startsWith("Fix the bug\n"));
+    assert.ok(result.includes("### STRUCTURED ACCEPTANCE EVIDENCE"));
   });
 
   test("appends CONSTRAINTS section", () => {

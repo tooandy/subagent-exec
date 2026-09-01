@@ -41,6 +41,7 @@ const TaskSchema = z.object({
 
   acceptance_criteria: z
     .array(z.string().min(1))
+    .refine((items) => new Set(items).size === items.length, "acceptance_criteria must be unique")
     .optional(),
 
   verification: z
@@ -163,6 +164,10 @@ export function buildWorkerPrompt(
       parts.push(`- ${a}`);
     }
   }
+
+  parts.push("");
+  parts.push("### STRUCTURED ACCEPTANCE EVIDENCE");
+  parts.push("End your response with a fenced `subagent-evidence` JSON object containing: assumptions, decisions, criteria (criterion, status, evidence), changed_symbols, tests_added, known_risks, unresolved_items, review_locations, and recommended_next_action. Evidence entries use type command|test|file|symbol plus a concrete reference. Use manual_review_required when a criterion lacks reproducible evidence.");
 
   return parts.join("\n");
 }

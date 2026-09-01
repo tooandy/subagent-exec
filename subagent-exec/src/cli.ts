@@ -329,7 +329,8 @@ function createFailedResult(
   taskId: string,
   error: WorkerError,
   startedAt: Date,
-  exitCode: number | null = null
+  exitCode: number | null = null,
+  acceptanceCriteria: string[] = []
 ) {
   return {
     schema_version: "1.0",
@@ -355,6 +356,14 @@ function createFailedResult(
       violations: []
     },
     verification: createDefaultVerification(),
+    acceptance_evidence: {
+      assumptions: [], decisions: [],
+      criteria: acceptanceCriteria.map((criterion) => ({ criterion, status: "manual_review_required" as const, evidence: [] })),
+      changed_symbols: [], tests_added: [], known_risks: [], unresolved_items: [], review_locations: [],
+      recommended_next_action: error.retryable
+        ? "Return to the coordinator to decide whether to retry with revised instructions."
+        : "Return to the coordinator for manual review and takeover."
+    },
     error
   };
 }
@@ -386,6 +395,8 @@ function applySessionPersistenceFailure(
     `Failed to persist continuation state: ${String(error)}`,
     { retryable: false }
   );
+  result.acceptance_evidence.recommended_next_action ??=
+    "Return to the coordinator for manual review and takeover.";
 }
 
 /*
@@ -624,7 +635,9 @@ async function main(): Promise<void> {
               }
             }
           ),
-          new Date()
+          new Date(),
+          null,
+          metadata.original_task.acceptance_criteria
         )
       );
       process.exitCode = 1;
@@ -637,7 +650,7 @@ async function main(): Promise<void> {
         "protocol", "CHECKPOINT_PLAN_NOT_APPROVED",
         `Task "${continueTask.task_id}" cannot continue because its planning round did not complete successfully.`,
         { retryable: false }
-      ), new Date()));
+      ), new Date(), null, metadata.original_task.acceptance_criteria));
       process.exitCode = 1;
       return;
     }
@@ -728,7 +741,9 @@ async function runIteration(
             `Task ID mismatch: CLI "${cliTaskId}" vs task.json "${task.task_id}"`,
             { retryable: false }
           ),
-          new Date()
+          new Date(),
+          null,
+          task.acceptance_criteria
         )
       );
       process.exitCode = 2;
@@ -756,7 +771,9 @@ async function runIteration(
         `Task did not pass delegation admission: ${admission.reasons.join("; ")}`,
         { retryable: false, details: { mode: admission.mode, reasons: admission.reasons } }
       ),
-      new Date()
+      new Date(),
+      null,
+      task.acceptance_criteria
     ));
     process.exitCode = 2;
     return;
@@ -815,7 +832,9 @@ async function runIteration(
       createFailedResult(
         task.task_id,
         classified,
-        startedAt
+        startedAt,
+        null,
+        task.acceptance_criteria
       )
     );
     process.exitCode = 1;
@@ -848,7 +867,9 @@ async function runIteration(
       createFailedResult(
         task.task_id,
         classifyError(error, "runtime"),
-        startedAt
+        startedAt,
+        null,
+        task.acceptance_criteria
       )
     );
     process.exitCode = 1;

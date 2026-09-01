@@ -79,6 +79,19 @@ Typical examples:
 - implement a well-defined API
 - perform a focused code review
 
+## Execution Mode Selection
+
+- Use `fast` only for low-risk, single-round implementation with deterministic
+  verification and explicit change budgets.
+- Use `checkpoint` for medium-risk implementation. The first round is a
+  read-only plan; review it before sending continuation feedback that authorizes
+  implementation.
+- Use `investigation` for high-risk or ambiguous work. It is always read-only
+  and single-round.
+
+Write-capable tasks without allowed paths, acceptance criteria, verification,
+or change budgets are intentionally rejected as `DELEGATION_NOT_RECOMMENDED`.
+
 ## When NOT to Use a Worker
 
 Do not delegate a task when:
@@ -134,7 +147,17 @@ Example:
     "src/rpc.ts",
     "src/cli.ts",
     "tests/"
-  ]
+  ],
+  "acceptance_criteria": ["Regression test passes"],
+  "verification": { "commands": ["npm test"] },
+  "iteration": { "max_iterations": 1 },
+  "execution_policy": {
+    "mode": "fast",
+    "risk": "low",
+    "max_changed_files": 3,
+    "max_diff_lines": 300,
+    "on_failure": "return_to_coordinator"
+  }
 }
 ```
 

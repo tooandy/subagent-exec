@@ -7,7 +7,8 @@ import {
 } from "node:util";
 
 import {
-  lstat
+  lstat,
+  readFile
 } from "node:fs/promises";
 
 import {
@@ -38,6 +39,73 @@ export class WorkspaceError extends Error {
     super(message);
     this.name = "WorkspaceError";
   }
+}
+
+export async function countDiffLines(
+  cwd: string,
+  files: string[],
+  baseline?: WorkspaceBaseline
+): Promise<number> {
+  if (files.length === 0) return 0;
+  let total = 0;
+  const remaining: string[] = [];
+  for (const file of files) {
+    if (!baseline?.dirtyPaths.has(file)) {
+      remaining.push(file);
+      continue;
+    }
+    const before = baseline.contents.get(file) ?? null;
+    let after: Buffer | null = null;
+    try { after = await readFile(resolve(cwd, file)); } catch { /* deleted */ }
+    if (isBinary(before) || isBinary(after)) return Number.MAX_SAFE_INTEGER;
+    total += changedTextLines(before, after);
+  }
+  if (remaining.length === 0) return total;
+  const outputs = await Promise.all([
+    git(cwd, ["diff", "HEAD", "--numstat", "--", ...remaining])
+  ]);
+  const tracked = new Set<string>();
+  for (const line of outputs.join("\n").split(/\r?\n/)) {
+    if (!line) continue;
+    const [added, deleted, path] = line.split("\t");
+    if (path) tracked.add(path);
+    if (added === "-" || deleted === "-") {
+      total = Number.MAX_SAFE_INTEGER;
+    } else {
+      total += (Number(added) || 0) + (Number(deleted) || 0);
+    }
+  }
+  for (const file of remaining) {
+    if (tracked.has(file)) continue;
+    try {
+      const content = await readFile(resolve(cwd, file));
+      if (isBinary(content)) return Number.MAX_SAFE_INTEGER;
+      total += textLines(content).length;
+    } catch {
+      // Deleted files are already represented by git numstat.
+    }
+  }
+  return total;
+}
+
+function isBinary(content: Buffer | null): boolean {
+  return content?.includes(0) ?? false;
+}
+
+function textLines(content: Buffer | null): string[] {
+  if (!content?.length) return [];
+  return content.toString("utf8").split(/\r?\n/).filter((_, index, lines) => index < lines.length - 1 || lines[index] !== "");
+}
+
+function changedTextLines(before: Buffer | null, after: Buffer | null): number {
+  const a = textLines(before);
+  const b = textLines(after);
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+  let aEnd = a.length - 1;
+  let bEnd = b.length - 1;
+  while (aEnd >= start && bEnd >= start && a[aEnd] === b[bEnd]) { aEnd--; bEnd--; }
+  return Math.max(0, aEnd - start + 1) + Math.max(0, bEnd - start + 1);
 }
 
 async function git(
@@ -80,6 +148,7 @@ async function git(
 export interface WorkspaceBaseline {
   dirtyPaths: Set<string>;
   fingerprints: Map<string, string>;
+  contents: Map<string, Buffer | null>;
 }
 
 /**
@@ -184,7 +253,7 @@ export async function captureBaseline(
     ]);
 
   if (!output) {
-    return { dirtyPaths: new Set(), fingerprints: new Map() };
+    return { dirtyPaths: new Set(), fingerprints: new Map(), contents: new Map() };
   }
 
   const paths =
@@ -220,11 +289,14 @@ export async function captureBaseline(
   }
 
   const fingerprints = new Map<string, string>();
+  const contents = new Map<string, Buffer | null>();
   for (const path of dirtyPaths) {
     fingerprints.set(path, await fingerprint(cwd, path));
+    try { contents.set(path, await readFile(resolve(cwd, path))); }
+    catch { contents.set(path, null); }
   }
 
-  return { dirtyPaths, fingerprints };
+  return { dirtyPaths, fingerprints, contents };
 }
 
 export type ScopeMode = "read_only" | "read_write";

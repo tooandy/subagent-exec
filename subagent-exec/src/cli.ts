@@ -57,9 +57,15 @@ import {
 import {
   captureBaseline,
   checkScope,
+  countDiffLines,
   WorkspaceError,
   type WorkspaceBaseline
 } from "./workspace.js";
+
+import {
+  evaluateAdmission,
+  isCheckpointPlanningRound
+} from "./admission.js";
 
 import {
   runVerification
@@ -625,6 +631,17 @@ async function main(): Promise<void> {
       return;
     }
 
+    if (metadata.original_task.execution_policy?.mode === "checkpoint" &&
+        metadata.last_result?.status !== "needs_continuation") {
+      printResult(createFailedResult(continueTask.task_id, createError(
+        "protocol", "CHECKPOINT_PLAN_NOT_APPROVED",
+        `Task "${continueTask.task_id}" cannot continue because its planning round did not complete successfully.`,
+        { retryable: false }
+      ), new Date()));
+      process.exitCode = 1;
+      return;
+    }
+
     /*
      * Synthesize a Task shape for runIteration() using original_task
      * parameters and the new feedback prompt.
@@ -647,6 +664,7 @@ async function main(): Promise<void> {
       acceptance_criteria: metadata.original_task.acceptance_criteria,
       verification: metadata.original_task.verification,
       iteration: metadata.original_task.iteration,
+      execution_policy: metadata.original_task.execution_policy,
       model: metadata.original_task.model,
       timeout_ms:
         continueTask.timeout_ms ??
@@ -728,6 +746,22 @@ async function runIteration(
     return;
   }
 
+  const admission = evaluateAdmission(task);
+  if (!admission.accepted) {
+    printResult(createFailedResult(
+      task.task_id,
+      createError(
+        "protocol",
+        "DELEGATION_NOT_RECOMMENDED",
+        `Task did not pass delegation admission: ${admission.reasons.join("; ")}`,
+        { retryable: false, details: { mode: admission.mode, reasons: admission.reasons } }
+      ),
+      new Date()
+    ));
+    process.exitCode = 2;
+    return;
+  }
+
   /*
    * 1b. Session setup.
    *
@@ -753,6 +787,7 @@ async function runIteration(
     existingSession
       ? existingSession.iteration + 1
       : 1;
+  const checkpointPlanning = isCheckpointPlanningRound(task, iterationNumber);
   const startedAt = new Date();
   const logger = new Logger(task.task_id);
 
@@ -943,7 +978,9 @@ async function runIteration(
    */
   const workerPrompt = buildWorkerPrompt(
     task.prompt,
-    task.constraints,
+    checkpointPlanning
+      ? [...(task.constraints ?? []), "Planning checkpoint only: do not modify files. Return a concise implementation plan for coordinator approval."]
+      : task.constraints,
     task.acceptance_criteria
   );
 
@@ -1132,7 +1169,7 @@ async function runIteration(
     }
     printResult(result);
 
-    process.exitCode = timeoutTriggered ? 124 : 130;
+    process.exitCode = timeoutTriggered ? 124 : error instanceof CancelledError ? 130 : 1;
     return;
   } finally {
     cleanupRace();
@@ -1249,7 +1286,9 @@ async function runIteration(
    */
   logger.log("scope_check_start");
 
-  const scopeMode = task.scope ?? "read_write";
+  const scopeMode = checkpointPlanning || task.execution_policy?.mode === "investigation"
+    ? "read_only"
+    : task.scope ?? "read_write";
 
   let scope: ScopeInfo;
 
@@ -1336,6 +1375,29 @@ async function runIteration(
     );
   }
 
+  if (!workerError && !checkpointPlanning && task.execution_policy?.mode !== "investigation") {
+    const maxFiles = task.execution_policy?.max_changed_files;
+    const maxLines = task.execution_policy?.max_diff_lines;
+    const diffLines = await countDiffLines(cwd, scope.changed_files, baseline);
+    if ((maxFiles !== undefined && scope.changed_files.length > maxFiles) ||
+        (maxLines !== undefined && diffLines > maxLines)) {
+      workerError = createError(
+        "scope",
+        "CHANGE_BUDGET_EXCEEDED",
+        "Worker changes exceeded the declared execution policy budget",
+        {
+          retryable: false,
+          details: {
+            changed_files: scope.changed_files.length,
+            max_changed_files: maxFiles,
+            diff_lines: diffLines,
+            max_diff_lines: maxLines
+          }
+        }
+      );
+    }
+  }
+
   /*
    * 13. Verification.
    */
@@ -1343,7 +1405,7 @@ async function runIteration(
 
   let verification = createDefaultVerification();
 
-  if (task.verification?.commands?.length) {
+  if (!checkpointPlanning && task.verification?.commands?.length) {
     const verifyTimeout =
       task.verification.timeout_ms ??
       DEFAULT_VERIFY_TIMEOUT;
@@ -1413,6 +1475,13 @@ async function runIteration(
     iterationNumber
   );
 
+  if (checkpointPlanning && !result.error) {
+    result.status = "needs_continuation";
+    result.needs_continuation = {
+      reason: "Checkpoint plan is ready for coordinator review"
+    };
+  }
+
   try {
     await persistIterationResult(session, result);
   } catch (sessionError) {
@@ -1430,7 +1499,7 @@ async function runIteration(
   });
 
   process.exitCode =
-    result.status === "success"
+    result.status === "success" || result.status === "needs_continuation"
       ? 0
       : timeoutTriggered
         ? 124

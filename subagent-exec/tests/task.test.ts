@@ -127,6 +127,10 @@ describe("parseTask", () => {
     }, /prompt/);
   });
 
+  test("rejects an unbounded prompt", () => {
+    assert.throws(() => parseTask({ schema_version: "1.0", task_id: "x", prompt: "x".repeat(12_001) }));
+  });
+
   test("rejects scope not in enum", () => {
     assert.throws(() => {
       parseTask({

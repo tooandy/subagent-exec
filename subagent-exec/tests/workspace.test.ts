@@ -14,8 +14,58 @@ import { execFileSync } from "node:child_process";
 import {
   captureBaseline,
   checkScope,
+  countDiffLines,
   type WorkspaceBaseline
 } from "../src/workspace.js";
+
+describe("countDiffLines", () => {
+  test("counts unstaged, staged, and untracked text changes", async () => {
+    const repo = await initRepo();
+    try {
+      await makeFile(repo.dir, "tracked.txt", "one\n");
+      await commitAll(repo.dir, "init");
+      await writeFile(join(repo.dir, "tracked.txt"), "one\ntwo\n");
+      await makeFile(repo.dir, "staged.txt", "a\nb\n");
+      execFileSync("git", ["add", "staged.txt"], { cwd: repo.dir });
+      await makeFile(repo.dir, "untracked.txt", "x\ny\n");
+      const count = await countDiffLines(repo.dir, ["tracked.txt", "staged.txt", "untracked.txt"]);
+      assert.ok(count >= 5);
+    } finally { await repo.cleanup(); }
+  });
+
+  test("treats binary changes as over any practical line budget", async () => {
+    const repo = await initRepo();
+    try {
+      await writeFile(join(repo.dir, "binary.bin"), Buffer.from([0, 1, 2, 3]));
+      execFileSync("git", ["add", "binary.bin"], { cwd: repo.dir });
+      await commitAll(repo.dir, "binary");
+      await writeFile(join(repo.dir, "binary.bin"), Buffer.from([0, 9, 8, 7]));
+      assert.equal(await countDiffLines(repo.dir, ["binary.bin"]), Number.MAX_SAFE_INTEGER);
+    } finally { await repo.cleanup(); }
+  });
+
+  test("treats an untracked binary as over budget", async () => {
+    const repo = await initRepo();
+    try {
+      await makeFile(repo.dir, "seed.txt", "seed\n");
+      await commitAll(repo.dir, "init");
+      await writeFile(join(repo.dir, "new.bin"), Buffer.from([0, 1, 2, 3]));
+      assert.equal(await countDiffLines(repo.dir, ["new.bin"]), Number.MAX_SAFE_INTEGER);
+    } finally { await repo.cleanup(); }
+  });
+
+  test("counts only worker changes to a pre-existing dirty file", async () => {
+    const repo = await initRepo();
+    try {
+      await makeFile(repo.dir, "tracked.txt", "base\n");
+      await commitAll(repo.dir, "init");
+      await writeFile(join(repo.dir, "tracked.txt"), `base\n${Array.from({ length: 20 }, (_, i) => `user-${i}`).join("\n")}\n`);
+      const baseline = await captureBaseline(repo.dir);
+      await writeFile(join(repo.dir, "tracked.txt"), `base\n${Array.from({ length: 20 }, (_, i) => `user-${i}`).join("\n")}\nworker\n`);
+      assert.equal(await countDiffLines(repo.dir, ["tracked.txt"], baseline), 1);
+    } finally { await repo.cleanup(); }
+  });
+});
 
 // =============================================================================
 // workspace.ts — integration tests against real temporary git repositories.

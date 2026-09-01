@@ -80,7 +80,6 @@ Introduce an `execution_policy` contract similar to:
     "risk": "medium",
     "max_changed_files": 5,
     "max_diff_lines": 500,
-    "max_iterations": 2,
     "on_failure": "return_to_coordinator"
   }
 }
@@ -89,13 +88,27 @@ Introduce an `execution_policy` contract similar to:
 Support three initial modes:
 
 1. **Fast** — one implementation attempt for low-risk, mechanical work.
-2. **Checkpoint** — short plan gate, implementation, and at most one repair
-   round for medium-risk work.
+2. **Checkpoint** — short plan gate followed by one coordinator-approved
+   implementation round for medium-risk work.
 3. **Investigation** — read-only evidence gathering for ambiguous or high-risk
    work; the coordinator owns the implementation decision.
 
 Return `DELEGATION_NOT_RECOMMENDED` when a requested implementation does not
 meet its admission requirements.
+
+Iteration limits remain owned by `iteration.max_iterations`: Fast requires 1,
+Checkpoint requires 2, and Investigation requires 1.
+
+### Phase 2 exit criteria
+
+- Inadmissible tasks are rejected before a Worker process is spawned.
+- Fast accepts only bounded low-risk, single-round implementation tasks.
+- Checkpoint produces a read-only first-round plan and requires coordinator
+  continuation before its implementation round.
+- Investigation is high-risk, single-round, and read-only.
+- File-count and diff-line budgets reject oversized implementation results.
+- Contract documentation and automated tests cover all modes and rejection
+  reasons.
 
 ## Phase 3: Structured acceptance evidence
 

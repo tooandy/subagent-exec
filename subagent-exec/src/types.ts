@@ -39,6 +39,17 @@ export interface IterationConfig {
   max_iterations?: number;
 }
 
+export type ExecutionMode = "fast" | "checkpoint" | "investigation";
+export type RiskLevel = "low" | "medium" | "high";
+
+export interface ExecutionPolicy {
+  mode: ExecutionMode;
+  risk: RiskLevel;
+  max_changed_files?: number;
+  max_diff_lines?: number;
+  on_failure: "return_to_coordinator";
+}
+
 export interface Task {
   schema_version: "1.0";
 
@@ -71,6 +82,8 @@ export interface Task {
   verification?: VerificationConfig;
 
   iteration?: IterationConfig;
+
+  execution_policy?: ExecutionPolicy;
 
   model?: TaskModel;
 
@@ -170,6 +183,7 @@ export interface SessionMetadata {
     acceptance_criteria?: string[];
     verification?: VerificationConfig;
     iteration?: IterationConfig;
+    execution_policy?: ExecutionPolicy;
     model?: TaskModel;
     timeout_ms?: number;
     metadata?: Record<string, unknown>;

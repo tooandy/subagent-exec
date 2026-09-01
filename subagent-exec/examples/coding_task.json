@@ -9,6 +9,18 @@
 
   "cwd": ".",
 
+  "scope": "read_write",
+
+  "iteration": { "max_iterations": 1 },
+
+  "execution_policy": {
+    "mode": "fast",
+    "risk": "low",
+    "max_changed_files": 1,
+    "max_diff_lines": 200,
+    "on_failure": "return_to_coordinator"
+  },
+
   "allowed_paths": [
     "tests/**"
   ],

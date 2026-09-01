@@ -27,8 +27,10 @@ process.stdin.on("data", (chunk) => {
     const command = JSON.parse(line);
     if (command.type === "prompt") {
       fs.appendFileSync(process.env.PI_PROMPTS_LOG, command.message + "\\n---PROMPT---\\n");
-      if (process.env.PI_TOUCH) fs.writeFileSync(process.env.PI_TOUCH, "worker change");
+      if (process.env.PI_TOUCH) fs.writeFileSync(process.env.PI_TOUCH, "one\\ntwo\\n");
+      if (process.env.PI_TOUCH_SECOND) fs.writeFileSync(process.env.PI_TOUCH_SECOND, "three\\n");
       process.stdout.write(JSON.stringify({type:"response",id:command.id,success:true})+"\\n");
+      if (process.env.PI_EXIT_EARLY) process.exit(7);
       if ((process.env.PI_MODE || ${JSON.stringify(mode)}) !== "hang") {
         process.stdout.write(JSON.stringify({type:"agent_start"})+"\\n");
         process.stdout.write(JSON.stringify({type:"message_end",message:{role:"assistant",content:"done"}})+"\\n");
@@ -65,6 +67,30 @@ process.stdin.on("data", (chunk) => {
 }
 
 function runCli(cwd: string, env: NodeJS.ProcessEnv, args: string[], input?: string) {
+  if (input !== undefined) {
+    const parsed = JSON.parse(input);
+    if (parsed.action !== "continue" && !parsed.execution_policy) {
+      if (parsed.scope === "read_only") {
+        parsed.iteration = { max_iterations: 1 };
+        parsed.execution_policy = { mode: "investigation", risk: "high", on_failure: "return_to_coordinator" };
+      } else {
+        const checkpoint = parsed.iteration?.max_iterations === 2;
+        parsed.scope = "read_write";
+        parsed.allowed_paths ??= ["*.txt"];
+        parsed.acceptance_criteria ??= ["Complete the requested task"];
+        parsed.verification ??= { commands: ["true"] };
+        parsed.iteration ??= { max_iterations: checkpoint ? 2 : 1 };
+        parsed.execution_policy = {
+          mode: checkpoint ? "checkpoint" : "fast",
+          risk: checkpoint ? "medium" : "low",
+          max_changed_files: 20,
+          max_diff_lines: 2000,
+          on_failure: "return_to_coordinator"
+        };
+      }
+      input = JSON.stringify(parsed);
+    }
+  }
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolvePromise) => {
     const child = spawn(process.execPath, [cli, ...args], { cwd, env, stdio: "pipe" });
     let stdout = ""; let stderr = "";
@@ -76,12 +102,25 @@ function runCli(cwd: string, env: NodeJS.ProcessEnv, args: string[], input?: str
 }
 
 describe("continuation CLI integration", () => {
+  test("rejects inadmissible delegation before spawning Pi", async () => {
+    const f = await fixture();
+    try {
+      const result = await runCli(f.dir, f.env, [], JSON.stringify({
+        schema_version: "1.0", task_id: "REJECT", prompt: "x", cwd: f.dir,
+        execution_policy: { mode: "fast", risk: "high", on_failure: "return_to_coordinator" }
+      }));
+      assert.equal(result.code, 2);
+      assert.equal(JSON.parse(result.stdout).error.code, "DELEGATION_NOT_RECOMMENDED");
+      await assert.rejects(() => readFile(f.argsLog, "utf8"));
+    } finally { await f.cleanup(); }
+  });
+
   test("starts then resumes the exact same session and reruns verification", async () => {
     const f = await fixture();
     try {
       const task = {
         schema_version: "1.0", task_id: "FLOW-1", prompt: "first", cwd: f.dir,
-        scope: "read_only", constraints: ["stay read-only"],
+        scope: "read_write", constraints: ["stay read-only"],
         acceptance_criteria: ["return a concise result"], iteration: { max_iterations: 2 },
         verification: { commands: ["node -e \"require('fs').appendFileSync('verified.log','v')\""] }
       };
@@ -91,7 +130,7 @@ describe("continuation CLI integration", () => {
         schema_version: "1.0", task_id: "FLOW-1", action: "continue", feedback: "review feedback"
       }));
       assert.equal(continued.code, 0, continued.stderr);
-      assert.equal(await readFile(join(f.dir, "verified.log"), "utf8"), "vv");
+      assert.equal(await readFile(join(f.dir, "verified.log"), "utf8"), "v");
       const args = (await readFile(f.argsLog, "utf8")).trim().split("\n").map(JSON.parse);
       const createdId = args[0][args[0].indexOf("--session-id") + 1];
       const resumedId = args[1][args[1].indexOf("--session") + 1];
@@ -191,7 +230,12 @@ describe("continuation CLI integration", () => {
 
       const child = spawn(process.execPath, [cli], { cwd: hanging.dir, env: hanging.env, stdio: "pipe" });
       let stdout = ""; child.stdout.on("data", (chunk) => { stdout += chunk; });
-      child.stdin.end(JSON.stringify({ schema_version: "1.0", task_id: "CANCEL", prompt: "x", cwd: hanging.dir, timeout_ms: 5000 }));
+      child.stdin.end(JSON.stringify({
+        schema_version: "1.0", task_id: "CANCEL", prompt: "x", cwd: hanging.dir, timeout_ms: 5000,
+        scope: "read_write", allowed_paths: ["*.txt"], acceptance_criteria: ["done"],
+        verification: { commands: ["true"] }, iteration: { max_iterations: 1 },
+        execution_policy: { mode: "fast", risk: "low", max_changed_files: 10, max_diff_lines: 100, on_failure: "return_to_coordinator" }
+      }));
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 700));
       child.kill("SIGTERM");
       const code = await new Promise<number | null>((resolvePromise) => child.on("exit", resolvePromise));
@@ -213,6 +257,7 @@ describe("continuation CLI integration", () => {
         iteration: { max_iterations: 2 }, verification: { commands: [command] }
       }));
       assert.equal(first.code, 0, first.stderr);
+      await writeFile(marker, "1", "utf8");
       const failed = await runCli(f.dir, f.env, ["--continue", "CONT-FAIL"], JSON.stringify({
         schema_version: "1.0", task_id: "CONT-FAIL", action: "continue", feedback: "x"
       }));
@@ -252,8 +297,10 @@ describe("continuation CLI integration", () => {
       const verificationLog = `${f.dir}.scope-verified`;
       const first = await runCli(f.dir, f.env, [], JSON.stringify({
         schema_version: "1.0", task_id: "SCOPE-CONT", prompt: "x", cwd: f.dir,
-        scope: "read_only", iteration: { max_iterations: 2 },
-        verification: { commands: [`touch '${verificationLog}'`] }
+        scope: "read_write", allowed_paths: ["tracked.txt"], iteration: { max_iterations: 2 },
+        acceptance_criteria: ["Complete safely"],
+        verification: { commands: [`touch '${verificationLog}'`] },
+        execution_policy: { mode: "checkpoint", risk: "medium", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
       }));
       assert.equal(first.code, 0, first.stderr);
       await rm(verificationLog, { force: true });
@@ -262,10 +309,95 @@ describe("continuation CLI integration", () => {
         schema_version: "1.0", task_id: "SCOPE-CONT", action: "continue", feedback: "x"
       }));
       const result = JSON.parse(continued.stdout);
-      assert.equal(result.error.code, "READ_ONLY_SCOPE_VIOLATION");
+      assert.equal(result.error.code, "MODIFICATION_SCOPE_VIOLATION");
       assert.equal(result.verification.status, "passed");
       assert.equal(await readFile(verificationLog, "utf8"), "");
       await rm(verificationLog, { force: true });
+    } finally { await f.cleanup(); }
+  });
+
+  test("enforces checkpoint planning and implementation change budgets", async () => {
+    const f = await fixture();
+    try {
+      const policy = { mode: "checkpoint", risk: "medium", max_changed_files: 2, max_diff_lines: 1, on_failure: "return_to_coordinator" };
+      const task = {
+        schema_version: "1.0", task_id: "BUDGET", prompt: "plan and implement", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["budget-change.txt"], acceptance_criteria: ["done"],
+        verification: { commands: ["true"] }, iteration: { max_iterations: 2 }, execution_policy: policy
+      };
+      const planned = await runCli(f.dir, f.env, [], JSON.stringify(task));
+      const planResult = JSON.parse(planned.stdout);
+      assert.equal(planResult.status, "needs_continuation");
+      assert.equal(planResult.scope.scope_mode, "read_only");
+      assert.equal(planResult.verification.status, "not_run");
+
+      const changed = join(f.dir, "budget-change.txt");
+      const implemented = await runCli(f.dir, { ...f.env, PI_TOUCH: changed }, ["--continue", "BUDGET"], JSON.stringify({
+        schema_version: "1.0", task_id: "BUDGET", action: "continue", feedback: "plan approved"
+      }));
+      const result = JSON.parse(implemented.stdout);
+      assert.equal(result.error.code, "CHANGE_BUDGET_EXCEEDED");
+      assert.ok(result.error.details.diff_lines > 1);
+    } finally { await f.cleanup(); }
+  });
+
+  test("does not continue a failed checkpoint planning round", async () => {
+    const f = await fixture();
+    try {
+      const task = {
+        schema_version: "1.0", task_id: "FAILED-PLAN", prompt: "plan", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["tracked.txt"], acceptance_criteria: ["approved plan"],
+        verification: { commands: ["true"] }, iteration: { max_iterations: 2 },
+        execution_policy: { mode: "checkpoint", risk: "medium", max_changed_files: 1, max_diff_lines: 10, on_failure: "return_to_coordinator" }
+      };
+      const failed = await runCli(f.dir, { ...f.env, PI_TOUCH: join(f.dir, "tracked.txt") }, [], JSON.stringify(task));
+      assert.equal(JSON.parse(failed.stdout).error.code, "READ_ONLY_SCOPE_VIOLATION");
+      const continued = await runCli(f.dir, f.env, ["--continue", "FAILED-PLAN"], JSON.stringify({
+        schema_version: "1.0", task_id: "FAILED-PLAN", action: "continue", feedback: "continue anyway"
+      }));
+      assert.equal(continued.code, 1);
+      assert.equal(JSON.parse(continued.stdout).error.code, "CHECKPOINT_PLAN_NOT_APPROVED");
+    } finally { await f.cleanup(); }
+  });
+
+  test("maps an unexpected child exit to failed exit code 1", async () => {
+    const f = await fixture();
+    try {
+      const failed = await runCli(f.dir, { ...f.env, PI_EXIT_EARLY: "1" }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "CHILD-EXIT", prompt: "x", cwd: f.dir
+      }));
+      assert.equal(failed.code, 1);
+      assert.equal(JSON.parse(failed.stdout).status, "failed");
+    } finally { await f.cleanup(); }
+  });
+
+  test("enforces max_changed_files", async () => {
+    const f = await fixture();
+    try {
+      const failed = await runCli(f.dir, {
+        ...f.env,
+        PI_TOUCH: join(f.dir, "one.txt"),
+        PI_TOUCH_SECOND: join(f.dir, "two.txt")
+      }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "FILE-BUDGET", prompt: "edit bounded files", cwd: f.dir,
+        scope: "read_write", allowed_paths: ["*.txt"], acceptance_criteria: ["done"],
+        verification: { commands: ["true"] }, iteration: { max_iterations: 1 },
+        execution_policy: { mode: "fast", risk: "low", max_changed_files: 1, max_diff_lines: 100, on_failure: "return_to_coordinator" }
+      }));
+      assert.equal(JSON.parse(failed.stdout).error.code, "CHANGE_BUDGET_EXCEEDED");
+    } finally { await f.cleanup(); }
+  });
+
+  test("keeps investigation mode single-round and read-only", async () => {
+    const f = await fixture();
+    try {
+      const failed = await runCli(f.dir, { ...f.env, PI_TOUCH: join(f.dir, "evidence.txt") }, [], JSON.stringify({
+        schema_version: "1.0", task_id: "INVESTIGATE", prompt: "inspect only", cwd: f.dir,
+        scope: "read_only", iteration: { max_iterations: 1 },
+        execution_policy: { mode: "investigation", risk: "high", on_failure: "return_to_coordinator" }
+      }));
+      assert.equal(failed.code, 1);
+      assert.equal(JSON.parse(failed.stdout).error.code, "READ_ONLY_SCOPE_VIOLATION");
     } finally { await f.cleanup(); }
   });
 });

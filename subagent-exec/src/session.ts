@@ -56,6 +56,13 @@ const SessionMetadataSchema = z.object({
     iteration: z.object({
       max_iterations: z.number().int().positive().max(3).optional()
     }).optional(),
+    execution_policy: z.object({
+      mode: z.enum(["fast", "checkpoint", "investigation"]),
+      risk: z.enum(["low", "medium", "high"]),
+      max_changed_files: z.number().int().positive().optional(),
+      max_diff_lines: z.number().int().positive().optional(),
+      on_failure: z.literal("return_to_coordinator")
+    }).optional(),
     model: z.object({
       provider: z.string().optional(),
       model: z.string().optional()
@@ -184,6 +191,7 @@ export function newSessionMetadata(task: Task): SessionMetadata {
       acceptance_criteria: task.acceptance_criteria,
       verification: task.verification,
       iteration: task.iteration,
+      execution_policy: task.execution_policy,
       model: task.model,
       timeout_ms: task.timeout_ms,
       metadata: task.metadata

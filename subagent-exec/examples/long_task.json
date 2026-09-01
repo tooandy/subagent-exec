@@ -9,6 +9,16 @@
 
   "cwd": ".",
 
+  "scope": "read_only",
+
+  "iteration": { "max_iterations": 1 },
+
+  "execution_policy": {
+    "mode": "investigation",
+    "risk": "high",
+    "on_failure": "return_to_coordinator"
+  },
+
   "allowed_paths": [],
 
   "constraints": [

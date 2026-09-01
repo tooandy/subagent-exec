@@ -22,7 +22,8 @@ const TaskSchema = z.object({
       "task_id must match ^[A-Za-z0-9._:-]+$, max 200 chars"
     ),
 
-  prompt: z.string().min(1),
+  // Keeps delegated work packets bounded enough to review and retry safely.
+  prompt: z.string().min(1).max(12_000),
 
   objective: z.string().optional(),
 
@@ -66,6 +67,14 @@ const TaskSchema = z.object({
         .optional()
     })
     .optional(),
+
+  execution_policy: z.object({
+    mode: z.enum(["fast", "checkpoint", "investigation"]),
+    risk: z.enum(["low", "medium", "high"]),
+    max_changed_files: z.number().int().positive().optional(),
+    max_diff_lines: z.number().int().positive().optional(),
+    on_failure: z.literal("return_to_coordinator")
+  }).optional(),
 
   model: z
     .object({

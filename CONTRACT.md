@@ -32,6 +32,7 @@ The Task Contract is supplied to `subagent-exec` either as a JSON file
 | `acceptance_criteria` | string[] | `[]` | Acceptance criteria sent to worker as a fixed `### ACCEPTANCE CRITERIA` section. Each entry becomes a bullet point. |
 | `verification` | object | — | Commands to run after worker completes (see below). |
 | `iteration` | object | `{ max_iterations: 2 }` | Bounded session rounds. `max_iterations` is 1–3 and includes the first round. |
+| `execution_policy` | object | — | Required delegation mode, risk, failure behavior, and implementation change budgets. |
 | `model` | object | — | `{ provider, model }` forwarded to worker runtime. |
 | `timeout_ms` | number | 900000 | Max execution time in ms. Max 24h (86400000). |
 | `metadata` | object | — | Free-form data passed through to the Result. |
@@ -69,6 +70,35 @@ overwrite constraints by editing the prompt.
 | Field | Type | Description |
 | --- | --- | --- |
 | `max_iterations` | integer | Total rounds including the first invocation. Defaults to 2; maximum 3. |
+
+### execution_policy sub-object
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `mode` | enum | `fast`, `checkpoint`, or `investigation`. |
+| `risk` | enum | `low`, `medium`, or `high`; constrained by mode. |
+| `max_changed_files` | integer | Required positive file budget for implementation modes. |
+| `max_diff_lines` | integer | Required positive changed-line budget for implementation modes. |
+| `on_failure` | enum | V1 requires `return_to_coordinator`. |
+
+Admission rules:
+
+- Fast requires `scope=read_write`, low risk, one iteration, allowed paths,
+  acceptance criteria, verification commands, and both change budgets.
+- Checkpoint requires the same implementation boundaries, medium risk, and two
+  iterations. Round one is forced read-only and returns
+  `needs_continuation`; round two performs implementation after coordinator
+  approval.
+- Investigation requires `scope=read_only`, high risk, and one iteration.
+- Missing or inconsistent boundaries return `DELEGATION_NOT_RECOMMENDED`
+  before Pi is spawned.
+- Prompts are capped at 12,000 characters. Implementation path patterns must
+  be repository-relative and may not select the whole repository (`*`, `**`,
+  `**/*`, absolute paths, and parent traversal are rejected). The coordinator
+  remains responsible for ensuring the prompt is semantically self-contained;
+  that property cannot be established reliably by syntax alone.
+- An implementation exceeding either budget returns
+  `CHANGE_BUDGET_EXCEEDED`.
 
 ## 1.1 Continue Task Contract
 
@@ -112,6 +142,14 @@ Runtime state is stored under `<cwd>/.subagent-exec/`: contract metadata in
   "prompt": "Implement OAuth 2.0 PKCE flow in src/auth/oauth.ts...",
   "cwd": "/workspace/project",
   "allowed_paths": ["src/auth/**", "tests/auth/**"],
+  "iteration": { "max_iterations": 1 },
+  "execution_policy": {
+    "mode": "fast",
+    "risk": "low",
+    "max_changed_files": 4,
+    "max_diff_lines": 500,
+    "on_failure": "return_to_coordinator"
+  },
   "constraints": ["Do not add new dependencies"],
   "acceptance_criteria": ["PKCE flow implemented", "Unit tests added"],
   "verification": { "commands": ["npm test"], "timeout_ms": 120000 },
@@ -129,7 +167,13 @@ Runtime state is stored under `<cwd>/.subagent-exec/`: contract metadata in
   "objective": "Review RPC lifecycle implementation",
   "prompt": "Review src/rpc.ts and src/cli.ts for race conditions...",
   "cwd": "/workspace/project",
-  "scope": "read_only"
+  "scope": "read_only",
+  "iteration": { "max_iterations": 1 },
+  "execution_policy": {
+    "mode": "investigation",
+    "risk": "high",
+    "on_failure": "return_to_coordinator"
+  }
 }
 ```
 
@@ -145,7 +189,7 @@ Runtime state is stored under `<cwd>/.subagent-exec/`: contract metadata in
 | --- | --- | --- |
 | `schema_version` | string `"1.0"` | Always present. |
 | `task_id` | string | Echoed from the Task Contract. |
-| `status` | enum | `success` / `failed` / `cancelled` / `timeout`. |
+| `status` | enum | `success` / `needs_continuation` / `failed` / `cancelled` / `timeout`. |
 | `worker` | object | Worker runtime info. |
 | `execution` | object | Timing and process info. |
 | `result` | object | Worker output (summary, final message, changed files). |
@@ -153,7 +197,8 @@ Runtime state is stored under `<cwd>/.subagent-exec/`: contract metadata in
 | `verification` | object | Verification command results. |
 | `usage` | object or null | Token / cost usage (may be null if unavailable). |
 | `iteration` | integer | Current one-based session round. |
-| `error` | object or null | Structured error when status != success. |
+| `needs_continuation` | object | Present when a Checkpoint plan awaits coordinator review. |
+| `error` | object or null | Structured error for failed, cancelled, or timeout results. |
 | `metadata` | object | Echoed from Task Contract. |
 
 ### worker
@@ -301,16 +346,20 @@ May be null if the worker runtime does not support session stats.
 | `AUTH_ERROR` | auth | Authentication / credential failure |
 | `TOKEN_LIMIT` | token | Context or token limit exceeded |
 | `WORKSPACE_ERROR` | runtime | Git repository check failed; workspace state unverifiable |
+| `DELEGATION_NOT_RECOMMENDED` | protocol | Admission policy rejected the task before Worker spawn |
+| `CHECKPOINT_PLAN_NOT_APPROVED` | protocol | Checkpoint continuation requested after an unsuccessful planning round |
+| `CHANGE_BUDGET_EXCEEDED` | scope | Worker exceeded the declared file-count or diff-line budget |
 
 ---
 
 ## 3. Status Values
 
-All four status values are mutually exclusive and exhaustive.
+All five status values are mutually exclusive and exhaustive.
 
 | Status | When it occurs |
 | --- | --- |
 | `success` | No error; task completed normally |
+| `needs_continuation` | Checkpoint planning completed; coordinator review is required before implementation |
 | `failed` | An error occurred (scope violation, verification failure, protocol error, runtime crash, etc.) |
 | `cancelled` | Task was interrupted by SIGINT or SIGTERM |
 | `timeout` | Task exceeded `timeout_ms` |
@@ -321,7 +370,7 @@ All four status values are mutually exclusive and exhaustive.
 
 | Code | Meaning |
 | ---: | --- |
-| 0 | success |
+| 0 | success or needs_continuation |
 | 1 | failed |
 | 2 | protocol / schema error (task.json invalid, task_id mismatch, etc.) |
 | 124 | timeout |

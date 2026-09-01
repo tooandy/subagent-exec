@@ -24,6 +24,7 @@ It owns:
 - Workspace scope verification
 - Verification command execution
 - Structured error classification
+- Delegation admission and change-budget enforcement
 
 It does NOT own:
 
@@ -86,6 +87,20 @@ Runtime metadata and Pi transcripts live separately under
 prompts and worker output, is ignored by Git, and should be removed or archived
 according to the workspace's data-retention policy.
 
+## Execution modes
+
+- `fast`: low-risk, bounded implementation in one round.
+- `checkpoint`: medium-risk work with a read-only planning round followed by
+  one coordinator-approved implementation round.
+- `investigation`: high-risk, single-round, read-only evidence gathering.
+
+Write-capable tasks must declare allowed paths, acceptance criteria,
+verification commands, and file/diff budgets. Tasks that do not meet their mode
+requirements are rejected before a Worker is started. Prompts are capped at
+12,000 characters and whole-repository path patterns are rejected; the
+coordinator remains responsible for making each prompt semantically
+self-contained.
+
 ## Run
 
 ```bash
@@ -114,7 +129,7 @@ cat examples/task.json | subagent-exec
 
 | Code | Meaning                  |
 | ---: | ------------------------ |
-|    0 | Task succeeded           |
+|    0 | Task succeeded, or Checkpoint plan awaits continuation |
 |    1 | Task failed              |
 |    2 | Protocol / schema error  |
 |  124 | Task timeout             |

@@ -1,16 +1,14 @@
 import { z } from "zod";
 
-import type { Task } from "./types.js";
+import type { Task, ContinueTask } from "./types.js";
 
 /**
  * Zod schema for Task Contract validation.
  *
  * Required fields: schema_version, task_id, prompt
  * Optional fields: objective, cwd, scope, allowed_paths, constraints,
- *                  acceptance_criteria, verification, model, timeout_ms, metadata
- *
- * This schema must stay in sync with the TypeScript Task interface
- * in types.ts and the CONTRACT.md specification.
+ *                  acceptance_criteria, verification, iteration, model,
+ *                  timeout_ms, metadata
  */
 const TaskSchema = z.object({
   schema_version: z.literal("1.0"),
@@ -58,10 +56,20 @@ const TaskSchema = z.object({
     })
     .optional(),
 
+  iteration: z
+    .object({
+      max_iterations: z
+        .number()
+        .int()
+        .positive()
+        .max(10)
+        .optional()
+    })
+    .optional(),
+
   model: z
     .object({
       provider: z.string().min(1).optional(),
-
       model: z.string().min(1).optional()
     })
     .optional(),
@@ -74,29 +82,51 @@ const TaskSchema = z.object({
     .optional(),
 
   metadata: z
-    .record(
-      z.string(),
-      z.unknown()
-    )
+    .record(z.string(), z.unknown())
     .optional()
 });
 
-export function parseTask(
-  value: unknown
-): Task {
+const ContinueTaskSchema = z.object({
+  schema_version: z.literal("1.0"),
+
+  task_id: z
+    .string()
+    .min(1)
+    .max(200)
+    .regex(
+      /^[A-Za-z0-9._:-]+$/,
+      "task_id must match ^[A-Za-z0-9._:-]+$"
+    ),
+
+  action: z.literal("continue"),
+
+  feedback: z.string().min(1),
+
+  timeout_ms: z
+    .number()
+    .int()
+    .positive()
+    .optional(),
+
+  metadata: z
+    .record(z.string(), z.unknown())
+    .optional()
+});
+
+export function parseTask(value: unknown): Task {
   return TaskSchema.parse(value) as Task;
+}
+
+export function parseContinueTask(value: unknown): ContinueTask {
+  return ContinueTaskSchema.parse(value) as ContinueTask;
 }
 
 /**
  * Build the prompt string sent to the worker.
  *
  * Sections are emitted in a fixed order so the worker can parse them
- * reliably.  Each section is clearly labelled so it cannot be confused
+ * reliably. Each section is clearly labelled so it cannot be confused
  * with user content.
- *
- * @param prompt   The raw task prompt
- * @param constraints  Optional implementation constraints
- * @param acceptance_criteria  Optional acceptance criteria
  */
 export function buildWorkerPrompt(
   prompt: string,
@@ -113,13 +143,51 @@ export function buildWorkerPrompt(
     }
   }
 
-  if (acceptance_criteria && acceptance_criteria.length > 0) {
+  if (
+    acceptance_criteria &&
+    acceptance_criteria.length > 0
+  ) {
     parts.push("");
     parts.push("### ACCEPTANCE CRITERIA");
-    for (const c of acceptance_criteria) {
-      parts.push(`- ${c}`);
+    for (const a of acceptance_criteria) {
+      parts.push(`- ${a}`);
     }
   }
+
+  return parts.join("\n");
+}
+
+/**
+ * Build the feedback prompt sent on a continuation round.
+ *
+ * Wraps Codex's review feedback so the worker can distinguish it
+ * from the original task description.
+ */
+export function buildContinuePrompt(
+  feedback: string,
+  iteration: number,
+  lastSummary?: string
+): string {
+  const parts: string[] = [];
+
+  parts.push(
+    `### REVIEW FEEDBACK (iteration ${iteration})`
+  );
+  parts.push("");
+  parts.push(feedback);
+
+  if (lastSummary) {
+    parts.push("");
+    parts.push("### YOUR PREVIOUS SUMMARY");
+    parts.push("");
+    parts.push(lastSummary);
+  }
+
+  parts.push("");
+  parts.push("Apply the feedback above and re-run your verification.");
+  parts.push(
+    "When done, summarize only what changed in this iteration."
+  );
 
   return parts.join("\n");
 }

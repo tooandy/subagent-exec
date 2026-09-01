@@ -203,3 +203,28 @@ export function verificationError(
     details
   );
 }
+
+export function maxIterationsError(
+  message: string,
+  details?: unknown
+): ClassifiedError {
+  return new ClassifiedError(
+    "runtime",
+    "MAX_ITERATIONS_EXCEEDED",
+    message,
+    false,
+    details
+  );
+}
+
+export function sessionNotFoundError(
+  taskId: string
+): ClassifiedError {
+  return new ClassifiedError(
+    "protocol",
+    "SESSION_NOT_FOUND",
+    `No active session for task_id "${taskId}". Start a new task with --task first.`,
+    false,
+    { task_id: taskId }
+  );
+}

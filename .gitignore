@@ -6,3 +6,4 @@ subagent-exec/dist/
 .DS_Store
 .env
 .env.local
+.subagent-exec/

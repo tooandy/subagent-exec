@@ -11,7 +11,8 @@ export type TaskStatus =
   | "success"
   | "failed"
   | "cancelled"
-  | "timeout";
+  | "timeout"
+  | "needs_continuation";
 
 export interface TaskModel {
   provider?: string;
@@ -24,34 +25,26 @@ export interface VerificationConfig {
 }
 
 /**
- * Task Contract — the input JSON for a worker invocation.
- *
- * Schema version 1.0 is the stable baseline. Fields introduced after 1.0
- * are added in separate minor-version documents and are opt-in.
- *
- * Required fields (must be present and non-empty):
- *   - schema_version  (must be "1.0")
- *   - task_id
- *   - prompt
- *
- * Optional fields:
- *   - objective       high-level intent; coordinator-only, NOT sent to worker
- *   - cwd             working directory; defaults to process cwd
- *   - scope           read_only | read_write  (default: read_write)
- *   - allowed_paths   glob patterns; empty + read_write → no scope check;
- *                     empty + read_only → ANY modification is a violation
- *   - constraints     implementation constraints sent to worker as fixed section
- *   - acceptance_criteria  criteria sent to worker as fixed section
- *   - verification    post-execution commands
- *   - model           { provider, model } forwarded to worker runtime
- *   - timeout_ms      max execution ms; default 900000; max 86400000
- *   - metadata        passthrough data
+ * Iteration control — limits how many times the same task
+ * session can be continued (i.e. how many feedback rounds
+ * between Codex and Worker).
  */
+export interface IterationConfig {
+  /**
+   * Maximum number of (prompt, response) rounds within a single
+   * task session. The first prompt counts as iteration 1.
+   * Default 1 means: start task, no continue. Set to 3 to
+   * allow Worker self-check + Codex review + one fix.
+   */
+  max_iterations?: number;
+}
+
 export interface Task {
   schema_version: "1.0";
 
-  /** Unique task identifier. Matches ^[A-Za-z0-9._:-]+$, max 200 chars. */
   task_id: string;
+
+  objective: string;
 
   /**
    * Self-contained instruction sent to the worker.
@@ -65,46 +58,122 @@ export interface Task {
    * High-level intent. Coordinator-only field; NOT transmitted to the worker.
    * Useful for Codex to track why a task was created.
    */
-  objective?: string;
+  objective_?: string;
 
-  /** Working directory for the worker. Defaults to process cwd. */
   cwd?: string;
 
-  /**
-   * Scope mode for the workspace.
-   *   - read_write  (default) worker may modify files matching allowed_paths
-   *   - read_only   any file creation, modification, or deletion fails the task
-   */
   scope?: "read_only" | "read_write";
 
-  /**
-   * Glob patterns the worker is allowed to modify.
-   *   - read_write + empty  → scope is not checked
-   *   - read_write + non-empty → only these paths may be modified
-   *   - read_only + any value → ANY change is a violation
-   */
   allowed_paths?: string[];
 
-  /**
-   * Implementation constraints sent to the worker as a structured section.
-   * Each entry becomes a bullet point; no free-form concatenation.
-   */
   constraints?: string[];
 
-  /**
-   * Acceptance criteria sent to the worker as a structured section.
-   * Each entry becomes a bullet point; no free-form concatenation.
-   */
   acceptance_criteria?: string[];
 
   verification?: VerificationConfig;
 
+  iteration?: IterationConfig;
+
   model?: TaskModel;
 
-  /** Maximum execution time in ms. Default 900000 (15 min). Max 86400000 (24 h). */
   timeout_ms?: number;
 
   metadata?: Record<string, unknown>;
+}
+
+/**
+ * A continuation command sent to an existing task session.
+ * Used for `subagent-exec --continue <task_id> --feedback <file>`.
+ */
+export interface ContinueTask {
+  schema_version: "1.0";
+
+  task_id: string;
+
+  action: "continue";
+
+  /**
+   * Feedback from Codex (review findings, additional context,
+   * retry instructions). Appended to the conversation as a new
+   * user turn in the existing Worker session.
+   */
+  feedback: string;
+
+  /**
+   * Optional per-iteration timeout override. If absent, the
+   * original task's timeout_ms applies.
+   */
+  timeout_ms?: number;
+
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Session metadata persisted between iterations of the same task.
+ *
+ * Lives at <session_dir>/<task_id>.json. Contains enough info for
+ * a fresh `subagent-exec --continue` invocation to spawn a new
+ * Pi process and resume the previous session.
+ */
+export interface SessionMetadata {
+  schema_version: "1.0";
+
+  task_id: string;
+
+  /**
+   * The worker runtime's session handle (e.g. Pi's session UUID).
+   * Used to spawn `--session <id>` on subsequent iterations.
+   */
+  worker_session_id?: string;
+
+  /**
+   * Path to the worker's session storage directory (e.g. Pi's
+   * ~/.pi/sessions/<project>/<id>). Used to disambiguate when
+   * multiple tasks share a worker session namespace.
+   */
+  worker_session_dir?: string;
+
+  /**
+   * Number of (prompt, response) rounds completed so far.
+   * The first start creates iteration 1; each continue bumps it.
+   */
+  iteration: number;
+
+  /**
+   * Last successful result, if any. Used to summarize for the
+   * next iteration's prompt so the worker can pick up where it
+   * left off without re-deriving context.
+   */
+  last_result?: {
+    status: TaskStatus;
+    summary?: string;
+    changed_files: string[];
+  };
+
+  /**
+   * Working directory captured at start. Continuation invocations
+   * must run in the same directory to keep scope check meaningful.
+   */
+  cwd: string;
+
+  created_at: string;
+  updated_at: string;
+
+  /**
+   * Original task parameters. Captured at start so continue
+   * commands don't need to resupply cwd/timeout/etc.
+   */
+  original_task: {
+    objective: string;
+    prompt: string;
+    scope?: "read_only" | "read_write";
+    allowed_paths?: string[];
+    constraints?: string[];
+    acceptance_criteria?: string[];
+    model?: TaskModel;
+    timeout_ms?: number;
+    metadata?: Record<string, unknown>;
+  };
 }
 
 export interface ExecutionInfo {
@@ -125,6 +194,12 @@ export interface WorkerInfo {
   provider?: string;
 
   model?: string;
+
+  /**
+   * The worker runtime's session ID for this iteration.
+   * Persisted to SessionMetadata.worker_session_id.
+   */
+  session_id?: string;
 }
 
 export interface UsageInfo {
@@ -225,6 +300,20 @@ export interface WorkerResult {
   verification: VerificationResult;
 
   usage?: UsageInfo;
+
+  /**
+   * Current iteration number (1-based). Always present.
+   */
+  iteration: number;
+
+  /**
+   * Set when status is needs_continuation — the Worker is asking
+   * Codex for review feedback. Always includes the changed_files
+   * so Codex can plan the next round without re-running git diff.
+   */
+  needs_continuation?: {
+    reason: string;
+  };
 
   error: WorkerError | null;
 

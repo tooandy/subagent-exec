@@ -22,8 +22,6 @@ export interface RpcState {
 
   /*
    * Final assistant message (only set from assistant role messages).
-   * Renamed from finalMessage for clarity — this field MUST only
-   * be populated from assistant messages, never from user prompt.
    */
   assistantMessage?: string;
 
@@ -80,10 +78,6 @@ function extractText(
   return result || undefined;
 }
 
-/*
- * Per review-3: only assistant-role messages should populate
- * the final assistant message. User messages must never overwrite it.
- */
 function isAssistantMessage(
   message: unknown
 ): boolean {
@@ -112,10 +106,6 @@ export function updateRpcState(
     case "agent_end":
       state.agentEnded = true;
 
-      /*
-       * agent_end may include messages array.
-       * Only update from assistant messages.
-       */
       if (Array.isArray(event.messages)) {
         for (
           const message of event.messages
@@ -140,10 +130,6 @@ export function updateRpcState(
       break;
 
     case "message_end": {
-      /*
-       * Only update on assistant message.
-       * Skip user message (the prompt itself).
-       */
       if (isAssistantMessage(event.message)) {
         const text =
           extractText(event.message);
@@ -170,11 +156,6 @@ export function updateRpcState(
     }
 
     case "message_update": {
-      /*
-       * message_update carries assistantMessageEvent with
-       * streaming text_delta events. These are always assistant.
-       * Accumulate into assistantMessage.
-       */
       const assistantEvent =
         event.assistantMessageEvent;
 
@@ -207,19 +188,19 @@ export function buildResult(
   state: RpcState,
   scope: ScopeInfo,
   verification: VerificationResult,
-  error: WorkerError | null
+  error: WorkerError | null,
+  iteration: number
 ): WorkerResult {
   let status:
     | "success"
     | "failed"
     | "cancelled"
-    | "timeout";
+    | "timeout"
+    | "needs_continuation";
 
   if (error?.code === "TASK_TIMEOUT") {
     status = "timeout";
-  } else if (
-    error?.code === "TASK_CANCELLED"
-  ) {
+  } else if (error?.code === "TASK_CANCELLED") {
     status = "cancelled";
   } else if (error) {
     status = "failed";
@@ -252,9 +233,12 @@ export function buildResult(
     },
 
     scope,
+
     verification,
 
     usage: state.usage,
+
+    iteration,
 
     error,
 

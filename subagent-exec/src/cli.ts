@@ -17,8 +17,21 @@ import type {
 
 import {
   parseTask,
-  buildWorkerPrompt
+  parseContinueTask,
+  buildWorkerPrompt,
+  buildContinuePrompt
 } from "./task.js";
+
+import {
+  loadSession,
+  saveSession,
+  deleteSession,
+  newSessionMetadata,
+  withIteration,
+  resolveSessionDir
+} from "./session.js";
+
+import type { SessionMetadata } from "./session.js";
 
 import {
   Logger
@@ -144,6 +157,28 @@ async function loadTaskInput(): Promise<unknown> {
 
   if (taskFile) {
     const text = await readFile(resolve(taskFile), "utf8");
+    return JSON.parse(text);
+  }
+
+  const stdinHandle = await open("/dev/stdin", "r");
+  const stdin = await stdinHandle.readFile("utf8");
+  await stdinHandle.close();
+
+  return JSON.parse(stdin);
+}
+
+async function loadContinueInput(): Promise<unknown> {
+  /*
+   * --feedback <path>: load Continue Task Contract from file.
+   * Otherwise read from stdin.
+   */
+  const feedbackFile = getArg("--feedback");
+
+  if (feedbackFile) {
+    const text = await readFile(
+      resolve(feedbackFile),
+      "utf8"
+    );
     return JSON.parse(text);
   }
 
@@ -451,10 +486,158 @@ function classifyStderrLine(line: string): WorkerError | null {
 
 async function main(): Promise<void> {
   /*
-   * 1. Parse task (--help is handled here too).
+   * Dispatch based on --continue flag.
+   *
+   * Start (default): load Task Contract, run first iteration, create session.
+   * Continue:        load Continue Task Contract, find existing session,
+   *                  resume Pi's conversation, run another iteration.
+   *
+   * In both cases the rest of the pipeline (worker spawn, RPC, scope,
+   * verification, result building) is identical — only the prompt
+   * sent to Pi differs.
+   */
+  const isContinue = hasArg("--continue");
+
+  if (isContinue) {
+    let rawContinue: unknown;
+    try {
+      rawContinue = await loadContinueInput();
+    } catch (error) {
+      printResult(
+        createFailedResult(
+          getArg("--continue") ?? "unknown",
+          classifyError(error, "protocol"),
+          new Date()
+        )
+      );
+      process.exitCode = 2;
+      return;
+    }
+
+    if (rawContinue === undefined) {
+      return;
+    }
+
+    let continueTask;
+    try {
+      continueTask = parseContinueTask(rawContinue);
+    } catch (error) {
+      printResult(
+        createFailedResult(
+          "unknown",
+          classifyError(error, "protocol"),
+          new Date()
+        )
+      );
+      process.exitCode = 2;
+      return;
+    }
+
+    /*
+     * Find the existing session for this task_id.
+     */
+    /*
+     * loadSession(cwd, task_id) resolves cwd to <cwd>/.subagent-exec
+     * internally. Pass the *expected* cwd from which the user is
+     * invoking the CLI — typically process.cwd() but the session
+     * can also be located by walking up parents if needed.
+     */
+    const metadata = await loadSession(
+      process.cwd(),
+      continueTask.task_id
+    );
+    if (!metadata) {
+      printResult(
+        createFailedResult(
+          continueTask.task_id,
+          {
+            category: "protocol",
+            code: "SESSION_NOT_FOUND",
+            message: `No active session for task_id "${continueTask.task_id}". Start a new task with --task first.`,
+            retryable: false,
+            details: { task_id: continueTask.task_id }
+          },
+          new Date()
+        )
+      );
+      process.exitCode = 2;
+      return;
+    }
+
+    /*
+     * Enforce max_iterations from the original task.
+     */
+    const maxIter =
+      metadata.original_task.metadata?.max_iterations as number | undefined;
+    const defaultMaxIter = 3;
+    const limit =
+      typeof maxIter === "number" && maxIter > 0
+        ? maxIter
+        : defaultMaxIter;
+
+    if (metadata.iteration >= limit) {
+      printResult(
+        createFailedResult(
+          continueTask.task_id,
+          createError(
+            "runtime",
+            "MAX_ITERATIONS_EXCEEDED",
+            `Task "${continueTask.task_id}" has already used ${metadata.iteration} of ${limit} allowed iterations. Codex should take over.`,
+            {
+              retryable: false,
+              details: {
+                iteration: metadata.iteration,
+                limit,
+                task_id: continueTask.task_id
+              }
+            }
+          ),
+          new Date()
+        )
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    /*
+     * Synthesize a Task shape for runIteration() using original_task
+     * parameters and the new feedback prompt.
+     */
+    const continuePrompt = buildContinuePrompt(
+      continueTask.feedback,
+      metadata.iteration + 1,
+      metadata.last_result?.summary
+    );
+
+    const synthetic: Task = {
+      schema_version: "1.0",
+      task_id: continueTask.task_id,
+      prompt: continuePrompt,
+      objective: metadata.original_task.objective,
+      cwd: metadata.cwd,
+      scope: metadata.original_task.scope,
+      allowed_paths: metadata.original_task.allowed_paths,
+      constraints: metadata.original_task.constraints,
+      acceptance_criteria: metadata.original_task.acceptance_criteria,
+      model: metadata.original_task.model,
+      timeout_ms:
+        continueTask.timeout_ms ??
+        metadata.original_task.timeout_ms,
+      metadata: {
+        ...(metadata.original_task.metadata ?? {}),
+        continuation_iteration: metadata.iteration + 1,
+        continuation_feedback: continueTask.feedback
+      }
+    };
+
+    await runIteration(synthetic, metadata);
+    return;
+  }
+
+  /*
+   * Default path: start a new task.
    */
   let rawTask: unknown;
-
   try {
     rawTask = await loadTaskInput();
   } catch (error) {
@@ -469,13 +652,20 @@ async function main(): Promise<void> {
     return;
   }
 
-  /*
-   * --help was requested.
-   */
   if (rawTask === undefined) {
-    return;
+    return; // --help handled
   }
 
+  await runIteration(rawTask, undefined);
+}
+
+async function runIteration(
+  rawTask: unknown,
+  existingSession: SessionMetadata | undefined
+): Promise<void> {
+  /*
+   * 1. Parse task.
+   */
   const cliTaskId = getArg("--task-id");
   let task: Task;
 
@@ -510,7 +700,32 @@ async function main(): Promise<void> {
     return;
   }
 
-  const cwd = resolve(task.cwd ?? process.cwd());
+  /*
+   * 1b. Session setup.
+   *
+   * If continuing, reuse existing session metadata. The original_task
+   * parameters (cwd, scope, model, etc.) come from session metadata,
+   * not from the Continue Task Contract — the latter only carries
+   * feedback.
+   *
+   * If starting fresh, create new metadata.
+   */
+  /*
+   * Resolve cwd to absolute path BEFORE creating session metadata.
+   * This ensures that resolveSessionDir() finds the same .subagent-exec
+   * directory on subsequent --continue invocations regardless of cwd.
+   */
+  const cwd = existingSession
+    ? existingSession.cwd
+    : resolve(task.cwd ?? process.cwd());
+
+  const session: SessionMetadata =
+    existingSession ?? newSessionMetadata({ ...task, cwd });
+
+  const iterationNumber =
+    existingSession
+      ? existingSession.iteration + 1
+      : 1;
   const startedAt = new Date();
   const logger = new Logger(task.task_id);
 
@@ -552,9 +767,19 @@ async function main(): Promise<void> {
   let rpc: PiRpcClient;
 
   try {
-    pi = spawnPi({ ...task, cwd });
+    pi = spawnPi(
+      { ...task, cwd },
+      {
+        continueFrom: existingSession,
+        sessionDir: resolveSessionDir(cwd)
+      }
+    );
     rpc = new PiRpcClient(pi.child);
-    logger.log("process_spawned", { pid: pi.pid });
+    logger.log("process_spawned", {
+      pid: pi.pid,
+      continuing: !!existingSession,
+      iteration: iterationNumber
+    });
   } catch (error) {
     printResult(
       createFailedResult(
@@ -750,7 +975,8 @@ async function main(): Promise<void> {
           violations: []
         },
         createDefaultVerification(),
-        workerError
+        workerError,
+        iterationNumber
       )
     );
 
@@ -839,7 +1065,8 @@ async function main(): Promise<void> {
           violations: []
         },
         createDefaultVerification(),
-        workerError
+        workerError,
+        iterationNumber
       )
     );
 
@@ -1123,14 +1350,60 @@ async function main(): Promise<void> {
     state,
     scope,
     verification,
-    workerError
+    workerError,
+    iterationNumber
   );
 
   printResult(result);
 
   logger.log("task_finished", {
-    status: result.status
+    status: result.status,
+    iteration: iterationNumber
   });
+
+  /*
+   * Persist session for continuation.
+   *
+   * If this iteration succeeded AND the task didn't already exceed
+   * max_iterations, save the new metadata. Codex can then issue
+   * `subagent-exec --continue <task_id> --feedback <file>` to
+   * resume the same Pi session.
+   *
+   * If the task failed (timeout, scope violation, etc.), we still
+   * save the session so Codex can decide whether to retry.
+   */
+  try {
+    const piSessionId = pi.child.pid
+      ? undefined // populated lazily below if available
+      : undefined;
+    void piSessionId;
+
+    /*
+     * If Pi's RPC layer exposes the session id via a get_session
+     * response, capture it here. For now we leave worker_session_id
+     * as whatever the previous metadata had — Pi's --continue
+     * reuses the most recent session in --session-dir anyway.
+     */
+    const updatedSession = withIteration(
+      session,
+      {
+        worker_session_id:
+          session.worker_session_id,
+        worker_session_dir: resolveSessionDir(cwd),
+        last_result: {
+          status: result.status,
+          summary: result.result.summary,
+          changed_files: result.result.changed_files
+        },
+        increment_iteration: true
+      }
+    );
+    await saveSession(updatedSession);
+  } catch (sessionError) {
+    logger.log("session_save_failed", {
+      error: String(sessionError)
+    });
+  }
 
   process.exitCode =
     result.status === "success"
